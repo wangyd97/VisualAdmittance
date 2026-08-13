@@ -35,13 +35,13 @@ def hand_eye_matrix() -> np.ndarray:
 def controller_params() -> dict:
     return dict(
         controller_mode="SOPD",
-        kp=250 * np.ones(6),
+        kp=150 * np.ones(6),
         kd=80 * np.ones(6),
         max_linear_vel=float("inf"),
         max_angular_vel=float("inf"),
-        feature_admittance_mass= 10.0,
-        feature_admittance_damping= 200.0,
-        feature_admittance_stiffness= 1000.0,
+        feature_admittance_mass= 1.0,
+        feature_admittance_damping= 100.0,
+        feature_admittance_stiffness= 250.0,
     )
 
 

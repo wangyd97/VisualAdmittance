@@ -140,7 +140,7 @@ class PBVSController:
         # e_T_c contains e_p_ce = p_c - p_e expressed in frame e.
         # Use p_ec = p_e - p_c to match the manuscript convention.
         self.e_p_ec = -self.e_T_c[:3, 3]
-        self.rtde_freq = 150.0
+        self.rtde_freq = 200.0
         self.dt = 1.0 / self.rtde_freq
 
         self.rtde_c = RTDEControl(robot_ip, self.rtde_freq)
