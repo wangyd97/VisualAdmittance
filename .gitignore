@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+data/
+figures/
+tables/
+exp_figures/
+csv_data/
+.mplconfig/
+
+draw_*.py
+Tools/draw_*.py
+plotting.py
+convert_png_to_pdf.py
+*.eps
+
+.DS_Store
