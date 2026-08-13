@@ -75,7 +75,7 @@ class FeatureSpaceAdmittance:
                 [np.zeros((3, 3)), R_base_cam],
             ])
             bc_inv = np.diag(np.asarray(self.cfg.feature_admittance_Bc_inv, dtype=float).reshape(6))
-            f_s -= L @ (rotate_cam_to_base @ (bc_inv @ wrench))
+            f_s += L @ (rotate_cam_to_base @ (bc_inv @ wrench))
 
         M = np.asarray(self.cfg.feature_admittance_mass, dtype=float).reshape(6)
         D = np.asarray(self.cfg.feature_admittance_damping, dtype=float).reshape(6)
@@ -89,7 +89,7 @@ class FeatureSpaceAdmittance:
         next_dot = (
             (M / self.dt) * previous_dot
             + K * (s_d - self.s_p)
-            - f_s
+            + f_s
         ) / denominator
 
         max_accel = np.asarray(
@@ -774,22 +774,74 @@ class PBVSController:
         K = self.estimator.K
         mode = self.cfg.controller_mode.upper()
         h_img, w_img = vis.shape[:2]
+        image_labels = []
 
         if corners is not None and R_cur is not None:
             pts = corners.astype(int)
             for i in range(4):
                 cv2.line(vis, tuple(pts[i]), tuple(pts[(i+1) % 4]), (0, 255, 0), 2)
-            current_label_point = tuple(pts[0] + np.array([8, -8]))
-            cv2.putText(vis, "Current", current_label_point,
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                        (0, 255, 0), 1, cv2.LINE_AA)
+            image_labels.append(
+                ("Current", pts[0], (8, -8), 0.45, (0, 255, 0))
+            )
             ori = draw_axis(vis, K, R_cur, t_cur, length=0.03)
             if ori is not None:
                 eu = euler_xyz_from_matrix(R_cur, degrees=True)
-                cv2.putText(vis, f"T:[{t_cur[0]:.3f},{t_cur[1]:.3f},{t_cur[2]:.3f}]",
-                            tuple(ori+[10, 5]), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1, cv2.LINE_AA)
-                cv2.putText(vis, f"R:[{eu[0]:.1f},{eu[1]:.1f},{eu[2]:.1f}]deg",
-                            tuple(ori+[10, 18]), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1, cv2.LINE_AA)
+                image_labels.append((
+                    f"T:[{t_cur[0]:.3f},{t_cur[1]:.3f},{t_cur[2]:.3f}]",
+                    ori, (10, 5), 0.35, (0, 255, 0),
+                ))
+                image_labels.append((
+                    f"R:[{eu[0]:.1f},{eu[1]:.1f},{eu[2]:.1f}]deg",
+                    ori, (10, 18), 0.35, (0, 255, 0),
+                ))
+
+            force_cam = np.asarray(self._last_wrench_cam[:3], dtype=float)
+            force_norm = float(np.linalg.norm(force_cam))
+            force_valid = (
+                self.cfg.enable_rtde_tcp_force
+                and self._force_bias_ready
+                and np.all(np.isfinite(force_cam))
+            )
+            if force_valid and force_norm > 1e-9:
+                # Draw a constant-length direction vector. Its label reports
+                # the measured magnitude, so large forces do not leave the view.
+                force_color = (0, 255, 255)
+                arrow_length_m = 0.06
+                arrow_start_3d = np.asarray(t_cur, dtype=float).reshape(3)
+                arrow_end_3d = (
+                    arrow_start_3d
+                    + arrow_length_m * force_cam / force_norm
+                )
+                arrow_3d = np.vstack([arrow_start_3d, arrow_end_3d])
+                if np.all(arrow_3d[:, 2] > 0):
+                    arrow_2d = project_3d_to_2d(arrow_3d, K).astype(int)
+                    arrow_start = tuple(arrow_2d[0])
+                    arrow_end = tuple(arrow_2d[1])
+                    if np.linalg.norm(arrow_2d[1] - arrow_2d[0]) >= 3.0:
+                        cv2.arrowedLine(
+                            vis, arrow_start, arrow_end,
+                            force_color, 3, cv2.LINE_AA, tipLength=0.25,
+                        )
+                    else:
+                        # A force nearly parallel to the optical axis has
+                        # almost no 2-D projection: x means +z (into image),
+                        # dot means -z (towards the camera).
+                        cv2.circle(vis, arrow_start, 7, force_color, 2, cv2.LINE_AA)
+                        if force_cam[2] >= 0.0:
+                            cv2.line(vis,
+                                     (arrow_start[0] - 4, arrow_start[1] - 4),
+                                     (arrow_start[0] + 4, arrow_start[1] + 4),
+                                     force_color, 2, cv2.LINE_AA)
+                            cv2.line(vis,
+                                     (arrow_start[0] - 4, arrow_start[1] + 4),
+                                     (arrow_start[0] + 4, arrow_start[1] - 4),
+                                     force_color, 2, cv2.LINE_AA)
+                        else:
+                            cv2.circle(vis, arrow_start, 3, force_color, -1, cv2.LINE_AA)
+                    image_labels.append((
+                        f"F_cam {force_norm:.1f} N",
+                        arrow_2d[1], (7, -7), 0.45, force_color,
+                    ))
 
         if self.cur_target is not None:
             Td = self._desired_T()
@@ -804,10 +856,9 @@ class PBVSController:
                     for i in range(4):
                         self._dashed_line(vis, tuple(pd2[i]), tuple(pd2[(i+1) % 4]),
                                           (255, 60, 60), 2, 10)
-                    desired_label_point = tuple(pd2[0] + np.array([8, -8]))
-                    cv2.putText(vis, "Desired", desired_label_point,
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                                (255, 60, 60), 1, cv2.LINE_AA)
+                    image_labels.append(
+                        ("Desired", pd2[0], (8, -8), 0.45, (255, 60, 60))
+                    )
                     draw_axis(vis, K, Rd, td, length=0.03)
 
         if np.all(np.isfinite(self._last_s_p)):
@@ -837,18 +888,12 @@ class PBVSController:
                             6,
                         )
                         cv2.circle(vis, tuple(proxy_points[i]), 3, proxy_color, -1)
-                    label_point = tuple(proxy_points[0] + np.array([8, -8]))
-                    cv2.putText(vis, "Proxy", label_point,
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                                proxy_color, 1, cv2.LINE_AA)
+                    image_labels.append(
+                        ("Proxy", proxy_points[0], (8, -8), 0.45, proxy_color)
+                    )
 
-        cv2.putText(vis, f"[{mode}] {self.cur_target.name if self.cur_target else ''}",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         hud_y = 45
         sat = self._last_accel_saturated
-        cv2.putText(vis, f"Accel-SAT: {'YES' if sat else 'no '}",
-                    (10, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                    (0, 0, 255) if sat else (0, 200, 80), 1, cv2.LINE_AA)
 
         if not self.cfg.enable_rtde_tcp_force:
             force_status = "Force-Zero: disabled"
@@ -862,11 +907,53 @@ class PBVSController:
                 f"{self.cfg.rtde_force_bias_samples}"
             )
             force_color = (0, 180, 255)
-        cv2.putText(vis, force_status, (10, hud_y + 20),
+        force_cam = np.asarray(self._last_wrench_cam[:3], dtype=float)
+        force_valid = (
+            self.cfg.enable_rtde_tcp_force
+            and self._force_bias_ready
+            and np.all(np.isfinite(force_cam))
+        )
+        if force_valid:
+            force_norm = float(np.linalg.norm(force_cam))
+            force_text = f"|F_cam|: {force_norm:.2f} N"
+            components_text = (
+                f"Fx:{force_cam[0]:+.2f}  Fy:{force_cam[1]:+.2f}  "
+                f"Fz:{force_cam[2]:+.2f} N"
+            )
+            measurement_color = (0, 255, 255)
+        else:
+            force_text = "|F_cam|: unavailable"
+            components_text = "Fx:--  Fy:--  Fz:--"
+            measurement_color = (140, 140, 140)
+        display = cv2.rotate(vis, cv2.ROTATE_180)
+
+        for text, anchor, offset, scale, color in image_labels:
+            anchor = np.asarray(anchor, dtype=int).reshape(2)
+            origin = (
+                int(w_img - 1 - anchor[0] + offset[0]),
+                int(h_img - 1 - anchor[1] + offset[1]),
+            )
+            cv2.putText(display, text, origin,
+                        cv2.FONT_HERSHEY_SIMPLEX, scale,
+                        color, 1, cv2.LINE_AA)
+
+        cv2.putText(display,
+                    f"[{mode}] {self.cur_target.name if self.cur_target else ''}",
+                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(display, f"Accel-SAT: {'YES' if sat else 'no '}",
+                    (10, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (0, 0, 255) if sat else (0, 200, 80), 1, cv2.LINE_AA)
+        cv2.putText(display, force_status, (10, hud_y + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     force_color, 1, cv2.LINE_AA)
-
-        cv2.imshow("SO-PBVS View", vis)
+        cv2.putText(display, force_text, (10, hud_y + 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    measurement_color, 1, cv2.LINE_AA)
+        cv2.putText(display, components_text, (10, hud_y + 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    measurement_color, 1, cv2.LINE_AA)
+        cv2.imshow("SO-PBVS View", display)
 
     def _dashed_line(self, img, pt1, pt2, color, thickness, dash_len):
         dist = np.linalg.norm(np.array(pt1) - np.array(pt2))
