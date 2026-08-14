@@ -15,7 +15,6 @@ else:
 
 ENABLE_VISUALIZATION = True
 ENABLE_MEMORY_LOG = True
-ENABLE_FINAL_PLOTS = True
 STATUS_PRINT_INTERVAL = 30
 APRILTAG_NTHREADS = 2
 APRILTAG_QUAD_DECIMATE = 2.0
@@ -45,19 +44,13 @@ def controller_params() -> dict:
     )
 
 
-def output_stem(enable_admittance: bool) -> str:
-    suffix = "_FSA" if enable_admittance else ""
-    return f"SOPD_cB{suffix}"
-
-
 def build_config(args) -> PBVSConfig:
     project_dir = Path(__file__).resolve().parent
-    figure_dir = project_dir / "figures"
     data_dir = project_dir / "data"
-    file_stem = output_stem(args.admittance)
-    log_suffix = "_FSA" if args.admittance else ""
+    controller_name = args.controller
+    enable_admittance = controller_name == "cA"
     params = controller_params()
-    if args.admittance:
+    if enable_admittance:
         # Conservative hardware envelope for force-driven motion.
         params.update(
             accel_limit_pos=float("inf"),
@@ -77,13 +70,11 @@ def build_config(args) -> PBVSConfig:
         rot_threshold=0.01,
         slow_after_convergence=False,
         max_runtime=args.runtime,
-        plot_save_path=str(figure_dir / f"{file_stem}.png"),
-        trajectory_plot_save_path=str(figure_dir / f"{file_stem}_trajectory.png"),
-        log_save_path=str(data_dir / f"log_cB{log_suffix}.csv"),
+        log_save_path=str(data_dir / f"log_{controller_name}.csv"),
         enable_memory_log=ENABLE_MEMORY_LOG,
-        enable_final_plots=ENABLE_FINAL_PLOTS,
         status_print_interval=STATUS_PRINT_INTERVAL,
-        enable_feature_admittance=args.admittance,
+        controller_name=controller_name,
+        enable_feature_admittance=enable_admittance,
         **params,
     )
 
@@ -103,18 +94,19 @@ def build_targets():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="cB PBVS controller with feature-space admittance."
+        description="Run the cO visual controller or cA visual-admittance controller."
+    )
+    parser.add_argument(
+        "--controller",
+        choices=["cO", "cA"],
+        default="cA",
+        help="cO: visual servoing only; cA: visual servoing with admittance.",
     )
     parser.add_argument(
         "--runtime",
         type=float,
         default=8.0,
         help="Recording duration in seconds. Use 0 for manual stop.",
-    )
-    parser.add_argument(
-        "--admittance",
-        action="store_true",
-        help="Enable feature-space admittance (disabled by default).",
     )
     args = parser.parse_args()
 

@@ -33,6 +33,7 @@ class PBVSConfig:
     Rc_lowpass_tau: float = 0.01
 
     controller_mode: str = "SOPD"
+    controller_name: str = "cA"
 
     enable_feature_admittance: bool = True
     feature_admittance_mass: object = 1.0
@@ -62,11 +63,8 @@ class PBVSConfig:
     accel_limit_pos: object = float("inf")
     accel_limit_rot: object = float("inf")
 
-    plot_save_path: str = "pbvs_error_plot.png"
-    trajectory_plot_save_path: str = ""
     log_save_path: str = "log.csv"
     enable_memory_log: bool = True
-    enable_final_plots: bool = True
     status_print_interval: int = 1
 
     def __post_init__(self):
@@ -86,11 +84,13 @@ class PBVSConfig:
         self.enable_Rc_lowpass = bool(self.enable_Rc_lowpass)
         self.Rc_lowpass_tau = max(0.0, float(self.Rc_lowpass_tau))
         self.enable_memory_log = bool(self.enable_memory_log)
-        self.enable_final_plots = bool(self.enable_final_plots)
         self.status_print_interval = max(1, int(self.status_print_interval))
 
         self.kp = to_vec6(self.kp, "kp")
         self.kd = to_vec6(self.kd, "kd")
+        self.controller_name = str(self.controller_name)
+        if self.controller_name not in ("cO", "cA"):
+            raise ValueError("controller_name must be 'cO' or 'cA'")
         self.enable_feature_admittance = bool(self.enable_feature_admittance)
         self.feature_admittance_mass = to_vec6(
             self.feature_admittance_mass, "feature_admittance_mass"

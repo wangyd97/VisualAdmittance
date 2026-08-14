@@ -573,6 +573,7 @@ class PBVSController:
         r_euler = euler_xyz_from_matrix(T_err[:3, :3], degrees=True)
 
         mode = self.cfg.controller_mode.upper()
+        controller_name = self.cfg.controller_name
 
         v_ctrl = self._u_c_to_tcp_twist_base(u_c, actual_pose)
         v_ctrl, velocity_saturated = self._clip_tcp_twist(v_ctrl)
@@ -620,6 +621,7 @@ class PBVSController:
             row = self._error_log[-1]
             row.update({
                 "frame_idx": int(self._frame_idx),
+                "controller": controller_name,
                 "controller_mode": mode,
                 "accel_saturated": int(self._last_accel_saturated),
                 "tcp_x": float(logged_pose[0]),
@@ -653,14 +655,6 @@ class PBVSController:
 
         return v_ctrl, (err_pos, err_rot), converged, corners, R_cur, t_cur
 
-    def plot_error_history(self):
-        from .plotting import plot_error_history
-        return plot_error_history(self)
-
-    def plot_trajectory_figure(self):
-        from .plotting import plot_trajectory_figure
-        return plot_trajectory_figure(self)
-
     def save_log_csv(self):
         if not self._error_log:
             print("No log data to save.")
@@ -691,7 +685,7 @@ class PBVSController:
         self._switch_target(0)
         self._reset_force_bias()
 
-        mode = self.cfg.controller_mode.upper()
+        controller_name = self.cfg.controller_name
 
         self._t0 = time.time()
         self._error_log.clear()
@@ -734,7 +728,7 @@ class PBVSController:
                         status = "CONVERGED" if converged else "Running"
                         ep, er = errs
                         sat_s = "SAT" if self._last_accel_saturated else "---"
-                        print(f"\r[{mode}] "
+                        print(f"\r[{controller_name}] "
                               f"{self.cur_target.name} | "
                               f"P:{ep*1000:.1f}mm R:{np.rad2deg(er):.1f}deg"
                               f" | [{sat_s}] {status}   ", end="", flush=True)
@@ -765,14 +759,11 @@ class PBVSController:
             self.rtde_c.stopScript()
             print("\nControl stopped.")
             self.save_log_csv()
-            if self.cfg.enable_final_plots:
-                self.plot_error_history()
-                self.plot_trajectory_figure()
 
     def _visualize(self, img, corners, v_cmd, R_cur, t_cur):
         vis = img.copy()
         K = self.estimator.K
-        mode = self.cfg.controller_mode.upper()
+        controller_name = self.cfg.controller_name
         h_img, w_img = vis.shape[:2]
         image_labels = []
 
@@ -938,7 +929,7 @@ class PBVSController:
                         color, 1, cv2.LINE_AA)
 
         cv2.putText(display,
-                    f"[{mode}] {self.cur_target.name if self.cur_target else ''}",
+                    f"[{controller_name}] {self.cur_target.name if self.cur_target else ''}",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                     (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(display, f"Accel-SAT: {'YES' if sat else 'no '}",

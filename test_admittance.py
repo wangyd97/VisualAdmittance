@@ -1,6 +1,8 @@
 import sys
 import types
 import unittest
+from argparse import Namespace
+from pathlib import Path
 
 import numpy as np
 
@@ -17,9 +19,21 @@ sys.modules.setdefault("rtde_receive", rtde_receive)
 from e2.config import PBVSConfig
 from e2.controller import FeatureSpaceAdmittance, PBVSController
 from e2.geometry import compute_L
+from e2.main import build_config
 
 
 class FeatureSpaceAdmittanceTests(unittest.TestCase):
+    def test_controller_name_selects_admittance_and_log(self):
+        visual = build_config(Namespace(runtime=8.0, controller="cO"))
+        admittance = build_config(Namespace(runtime=8.0, controller="cA"))
+
+        self.assertEqual(visual.controller_name, "cO")
+        self.assertFalse(visual.enable_feature_admittance)
+        self.assertEqual(Path(visual.log_save_path).name, "log_cO.csv")
+        self.assertEqual(admittance.controller_name, "cA")
+        self.assertTrue(admittance.enable_feature_admittance)
+        self.assertEqual(Path(admittance.log_save_path).name, "log_cA.csv")
+
     def test_default_parameters_remain_bounded_and_converge(self):
         cfg = PBVSConfig(enable_feature_admittance=True)
         model = FeatureSpaceAdmittance(cfg, 1.0 / 60.0)
