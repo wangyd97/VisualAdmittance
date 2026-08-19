@@ -1,2 +1,24 @@
-# VisualAdmittance
-an visual-admittance controller which does not repeated impact
+# Visual admittance controllers
+
+The `e2` experiment provides three PBVS controller variants:
+
+- `cO`: visual servoing only.
+- `cA`: feature-space admittance with proxy feature `s_p`.
+- `cB`: base-frame Cartesian admittance with a proxy camera pose.
+
+Run a controller with, for example:
+
+```powershell
+python e2\main.py --controller cB
+```
+
+`cB` implements
+
+```text
+measured wrench -> Cartesian admittance -> proxy camera pose -> PBVS/SOPD
+```
+
+Its Cartesian offset, velocity, and acceleration are saved as
+`cart_offset0..5`, `cart_velocity0..5`, and `cart_acceleration0..5` in
+`e2/data/log_cB.csv`.  The existing `s`, `sp`, and `sd` columns remain
+available so that controller results can be plotted with the same tools.

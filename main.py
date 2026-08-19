@@ -41,6 +41,9 @@ def controller_params() -> dict:
         feature_admittance_mass= 1.0,
         feature_admittance_damping= 20.0,
         feature_admittance_stiffness= 500.0,
+        cartesian_admittance_mass=(1.0, 1.0, 1.0, 0.1, 0.1, 0.1),
+        cartesian_admittance_damping=(20.0, 20.0, 20.0, 2.0, 2.0, 2.0),
+        cartesian_admittance_stiffness=(500.0, 500.0, 500.0, 20.0, 20.0, 20.0),
     )
 
 
@@ -48,15 +51,25 @@ def build_config(args) -> PBVSConfig:
     project_dir = Path(__file__).resolve().parent
     data_dir = project_dir / "data"
     controller_name = args.controller
-    enable_admittance = controller_name == "cA"
+    enable_feature_admittance = controller_name == "cA"
+    enable_cartesian_admittance = controller_name == "cB"
     params = controller_params()
-    if enable_admittance:
+    if enable_feature_admittance:
         # Conservative hardware envelope for force-driven motion.
         params.update(
             accel_limit_pos=float("inf"),
             accel_limit_rot=float("inf"),
             max_linear_vel=float("inf"),
             max_angular_vel=float("inf"),
+        )
+    elif enable_cartesian_admittance:
+        # cB directly converts physical wrench into a Cartesian pose offset.
+        # Keep finite command limits while validating it on hardware.
+        params.update(
+            accel_limit_pos=1.0,
+            accel_limit_rot=5.0,
+            max_linear_vel=0.10,
+            max_angular_vel=0.50,
         )
 
     return PBVSConfig(
@@ -74,7 +87,8 @@ def build_config(args) -> PBVSConfig:
         enable_memory_log=ENABLE_MEMORY_LOG,
         status_print_interval=STATUS_PRINT_INTERVAL,
         controller_name=controller_name,
-        enable_feature_admittance=enable_admittance,
+        enable_feature_admittance=enable_feature_admittance,
+        enable_cartesian_admittance=enable_cartesian_admittance,
         **params,
     )
 
@@ -94,13 +108,19 @@ def build_targets():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run the cO visual controller or cA visual-admittance controller."
+        description=(
+            "Run cO visual servoing, cA feature-space admittance, "
+            "or cB Cartesian-space admittance."
+        )
     )
     parser.add_argument(
         "--controller",
-        choices=["cO", "cA"],
+        choices=["cO", "cA", "cB"],
         default="cA",
-        help="cO: visual servoing only; cA: visual servoing with admittance.",
+        help=(
+            "cO: visual servoing only; cA: feature-space admittance; "
+            "cB: Cartesian-space admittance."
+        ),
     )
     parser.add_argument(
         "--runtime",

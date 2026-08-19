@@ -81,7 +81,7 @@ class FeatureSpaceAdmittance:
         D = np.asarray(self.cfg.feature_admittance_damping, dtype=float).reshape(6)
         K = np.asarray(self.cfg.feature_admittance_stiffness, dtype=float).reshape(6)
         # Backward-Euler update of
-        # M*s_p_ddot + D*s_p_dot + K*(s_p-s_d) = -f_s.
+        # M*s_p_ddot + D*s_p_dot + K*(s_p-s_d) = f_s.
         # The previous explicit update is unstable for the defaults at 60 Hz:
         # D*dt/M = 3.33, so velocity changed sign and grew every sample.
         previous_dot = self.s_p_dot.copy()
@@ -130,6 +130,92 @@ class FeatureSpaceAdmittance:
         return self.s_p.copy()
 
 
+class CartesianSpaceAdmittance:
+    """Base-frame Cartesian admittance for a camera-pose offset."""
+
+    def __init__(self, cfg: PBVSConfig, dt: float):
+        self.cfg = cfg
+        self.dt = float(dt)
+        self.offset = np.zeros(6)
+        self.velocity = np.zeros(6)
+        self.acceleration = np.zeros(6)
+
+    def reset(self):
+        self.offset = np.zeros(6)
+        self.velocity = np.zeros(6)
+        self.acceleration = np.zeros(6)
+
+    def compute(self, external_wrench_base: Optional[np.ndarray]) -> np.ndarray:
+        if not self.cfg.enable_cartesian_admittance:
+            self.reset()
+            return self.offset.copy()
+
+        wrench = np.zeros(6)
+        if external_wrench_base is not None:
+            wrench = np.asarray(external_wrench_base, dtype=float).reshape(6)
+            if not np.all(np.isfinite(wrench)):
+                wrench = np.zeros(6)
+        wrench *= np.asarray(
+            self.cfg.cartesian_admittance_wrench_scale, dtype=float
+        ).reshape(6)
+
+        mass = np.asarray(
+            self.cfg.cartesian_admittance_mass, dtype=float
+        ).reshape(6)
+        damping = np.asarray(
+            self.cfg.cartesian_admittance_damping, dtype=float
+        ).reshape(6)
+        stiffness = np.asarray(
+            self.cfg.cartesian_admittance_stiffness, dtype=float
+        ).reshape(6)
+
+        # Backward-Euler update of
+        # M*x_ddot + D*x_dot + K*x = wrench, where x is a base-frame
+        # [translation, rotation-vector] offset of the desired camera pose.
+        previous_velocity = self.velocity.copy()
+        denominator = mass / self.dt + damping + stiffness * self.dt
+        next_velocity = (
+            (mass / self.dt) * previous_velocity
+            - stiffness * self.offset
+            + wrench
+        ) / denominator
+
+        max_acceleration = np.asarray(
+            self.cfg.cartesian_admittance_max_acceleration, dtype=float
+        ).reshape(6)
+        next_acceleration = np.clip(
+            (next_velocity - previous_velocity) / self.dt,
+            -max_acceleration,
+            max_acceleration,
+        )
+        next_velocity = previous_velocity + next_acceleration * self.dt
+
+        max_velocity = np.asarray(
+            self.cfg.cartesian_admittance_max_velocity, dtype=float
+        ).reshape(6)
+        next_velocity = np.clip(next_velocity, -max_velocity, max_velocity)
+        next_offset = self.offset + next_velocity * self.dt
+
+        max_offset = np.asarray(
+            self.cfg.cartesian_admittance_max_offset, dtype=float
+        ).reshape(6)
+        clipped_offset = np.clip(next_offset, -max_offset, max_offset)
+        offset_saturated = np.abs(clipped_offset - next_offset) > 1e-12
+        next_velocity[offset_saturated] = 0.0
+
+        if not (
+            np.all(np.isfinite(clipped_offset))
+            and np.all(np.isfinite(next_velocity))
+        ):
+            self.reset()
+            raise FloatingPointError("Non-finite Cartesian-admittance state")
+
+        self.acceleration = (next_velocity - previous_velocity) / self.dt
+        self.velocity = next_velocity
+        self.offset = clipped_offset
+        return self.offset.copy()
+
+
 class PBVSController:  
     def __init__(self, robot_ip: str, intrinsics,
                  hand_eye_calib: np.ndarray,
@@ -162,6 +248,7 @@ class PBVSController:
         self._u_c_integrated = np.zeros(6)
 
         self._feature_admittance = FeatureSpaceAdmittance(self.cfg, self.dt)
+        self._cartesian_admittance = CartesianSpaceAdmittance(self.cfg, self.dt)
         self._error_log: list = []
         self._t0: float = 0.0
         self._frame_idx = 0
@@ -174,6 +261,9 @@ class PBVSController:
         self._last_s_p = np.full(6, float("nan"))
         self._last_s_d = np.full(6, float("nan"))
         self._last_s_dot = np.zeros(6)
+        self._last_s_p_dot = np.zeros(6)
+        self._last_s_p_ddot = np.zeros(6)
+        self._last_cartesian_proxy_quat: Optional[np.ndarray] = None
         self._force_bias = np.zeros(6)
         self._force_bias_ready = self.cfg.rtde_force_bias_samples <= 0
         self._force_bias_count = 0
@@ -201,6 +291,7 @@ class PBVSController:
         self.stable_cnt = 0
         self._u_c_integrated = np.zeros(6)
         self._feature_admittance.reset()
+        self._cartesian_admittance.reset()
         self._last_u_c = np.zeros(6)
         self._last_R_base_cam = None
         self._last_detection = None
@@ -209,6 +300,9 @@ class PBVSController:
         self._last_s_p = np.full(6, float("nan"))
         self._last_s_d = np.full(6, float("nan"))
         self._last_s_dot = np.zeros(6)
+        self._last_s_p_dot = np.zeros(6)
+        self._last_s_p_ddot = np.zeros(6)
+        self._last_cartesian_proxy_quat = None
         self._force_lowpass = np.zeros(6)
         self._last_wrench_tcp_raw = np.full(6, float("nan"))
         self._last_wrench_tcp = np.full(6, float("nan"))
@@ -311,8 +405,65 @@ class PBVSController:
                 saturated = True
         return clipped, saturated
 
+    def _compute_cartesian_proxy_feature(
+            self,
+            T_current: np.ndarray,
+            T_base_cam: np.ndarray,
+            R_base_cam: np.ndarray,
+            external_wrench_cam: Optional[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+        """Generate the cB proxy pose, then express it as the PBVS feature."""
+        wrench_base = None
+        if external_wrench_cam is not None:
+            rotate_cam_to_base = np.block([
+                [R_base_cam, np.zeros((3, 3))],
+                [np.zeros((3, 3)), R_base_cam],
+            ])
+            wrench_base = rotate_cam_to_base @ np.asarray(
+                external_wrench_cam, dtype=float
+            ).reshape(6)
+
+        offset = self._cartesian_admittance.compute(wrench_base)
+
+        # Vision provides c_T_o.  Combining it with the measured camera pose
+        # gives b_T_o, from which the nominal desired camera pose is obtained.
+        T_base_object = T_base_cam @ T_current
+        T_base_cam_desired = T_base_object @ inv_T(self._desired_T())
+
+        # The six admittance coordinates are independent base-frame position
+        # and rotation-vector offsets.  Apply rotation about the camera origin,
+        # rather than rotating its position about the base origin.
+        T_base_cam_proxy = T_base_cam_desired.copy()
+        T_base_cam_proxy[:3, :3] = (
+            matrix_from_rotvec(offset[3:6]) @ T_base_cam_desired[:3, :3]
+        )
+        T_base_cam_proxy[:3, 3] = T_base_cam_desired[:3, 3] + offset[:3]
+
+        T_proxy = inv_T(T_base_cam_proxy) @ T_base_object
+        proxy_quat = quat_from_matrix(T_proxy[:3, :3])
+        if self._last_cartesian_proxy_quat is not None:
+            proxy_quat = self._nearer_quat(
+                self._last_cartesian_proxy_quat, proxy_quat
+            )
+        self._last_cartesian_proxy_quat = proxy_quat.copy()
+        s_p = np.concatenate([T_proxy[:3, 3], proxy_quat[1:4]])
+
+        # For the stationary-object PBVS model, the Cartesian proxy velocity
+        # produces feature velocity through the same interaction matrix.  This
+        # avoids differentiating noisy AprilTag pose estimates.
+        previous_dot = self._last_s_p_dot.copy()
+        L_proxy = compute_L(
+            T_proxy[:3, 3],
+            proxy_quat,
+            T_base_cam_proxy[:3, :3],
+        )
+        s_p_dot = L_proxy @ self._cartesian_admittance.velocity
+        self._last_s_p_ddot = (s_p_dot - previous_dot) / self.dt
+        self._last_s_p_dot = s_p_dot.copy()
+        return s_p, s_p_dot
+
     def _compute_control(self, T_current: np.ndarray,
                          R_base_cam: np.ndarray,
+                         T_base_cam: Optional[np.ndarray] = None,
                          external_wrench_cam: np.ndarray = None,
                          feature_force: np.ndarray = None):
         s, s_d = self._compute_features(T_current)
@@ -324,14 +475,26 @@ class PBVSController:
         except np.linalg.LinAlgError:
             L_inv = np.linalg.pinv(L)
         
-        s_p = self._feature_admittance.compute(
-            s_d=s_d,
-            L=L,
-            external_wrench_cam=external_wrench_cam,
-            feature_force=feature_force,
-            R_base_cam=R_base_cam,
-        )
-        s_p_dot = self._feature_admittance.s_p_dot.copy()
+        if self.cfg.controller_name == "cB":
+            if T_base_cam is None:
+                raise ValueError("T_base_cam is required by controller cB")
+            s_p, s_p_dot = self._compute_cartesian_proxy_feature(
+                T_current,
+                T_base_cam,
+                R_base_cam,
+                external_wrench_cam,
+            )
+        else:
+            s_p = self._feature_admittance.compute(
+                s_d=s_d,
+                L=L,
+                external_wrench_cam=external_wrench_cam,
+                feature_force=feature_force,
+                R_base_cam=R_base_cam,
+            )
+            s_p_dot = self._feature_admittance.s_p_dot.copy()
+            self._last_s_p_dot = s_p_dot.copy()
+            self._last_s_p_ddot = self._feature_admittance.s_p_ddot.copy()
         e = s_p - s
         u_c = self._last_u_c.copy()
         
@@ -551,6 +714,11 @@ class PBVSController:
         R_base_cam = R_base_tcp @ self.e_R_c
         R_base_cam = self._filter_R_base_cam(R_base_cam)
         self._last_R_base_cam = R_base_cam.copy()
+        T_base_tcp = np.eye(4)
+        T_base_tcp[:3, :3] = R_base_tcp
+        T_base_tcp[:3, 3] = actual_pose[:3]
+        T_base_cam = T_base_tcp @ self.e_T_c
+        T_base_cam[:3, :3] = R_base_cam
         if external_wrench_cam is None:
             external_wrench_cam = self._tcp_wrench_to_camera(
                 rtde_wrench_tcp,
@@ -561,6 +729,7 @@ class PBVSController:
         u_c, u_dot_c = self._compute_control(
             T_cur,
             R_base_cam,
+            T_base_cam=T_base_cam,
             external_wrench_cam=external_wrench_cam,
             feature_force=feature_force,
         )
@@ -642,14 +811,17 @@ class PBVSController:
                 row[f"s{i}"] = float(self._last_s[i])
                 row[f"sp{i}"] = float(self._last_s_p[i])
                 row[f"sd{i}"] = float(self._last_s_d[i])
-                row[f"spdot{i}"] = float(self._feature_admittance.s_p_dot[i])
-                row[f"spddot{i}"] = float(self._feature_admittance.s_p_ddot[i])
+                row[f"spdot{i}"] = float(self._last_s_p_dot[i])
+                row[f"spddot{i}"] = float(self._last_s_p_ddot[i])
                 row[f"sdot{i}"] = float(self._last_s_dot[i])
                 row[f"uc{i}"] = float(u_c[i])
                 row[f"udotc{i}"] = float(u_dot_c[i])
                 row[f"tcp_force_raw{i}"] = float(self._last_wrench_tcp_raw[i])
                 row[f"tcp_force{i}"] = float(self._last_wrench_tcp[i])
                 row[f"cam_force{i}"] = float(self._last_wrench_cam[i])
+                row[f"cart_offset{i}"] = float(self._cartesian_admittance.offset[i])
+                row[f"cart_velocity{i}"] = float(self._cartesian_admittance.velocity[i])
+                row[f"cart_acceleration{i}"] = float(self._cartesian_admittance.acceleration[i])
 
         self._frame_idx += 1
 
@@ -713,7 +885,7 @@ class PBVSController:
                 tcp_pose_ctrl = self._control_tcp_pose(tcp_pose_now)
                 wrench_raw = self._read_rtde_tcp_force()
                 rtde_wrench_tcp = self._update_force_bias_and_filter(wrench_raw)
-
+                print(rtde_wrench_tcp,'\n')
                 v_cmd, errs, converged, corners, R_cur, t_cur = self.process_step(
                     gray,
                     tcp_pose=tcp_pose_ctrl,

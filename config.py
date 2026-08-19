@@ -47,6 +47,18 @@ class PBVSConfig:
     feature_admittance_max_velocity: object = (0.10, 0.10, 0.10, 0.50, 0.50, 0.50)
     feature_admittance_max_acceleration: object = (1.0, 1.0, 1.0, 5.0, 5.0, 5.0)
 
+    enable_cartesian_admittance: bool = False
+    # Cartesian admittance state is a base-frame camera-pose offset
+    # [dx, dy, dz, dRx, dRy, dRz].  Translational and rotational entries
+    # therefore use physical Cartesian units rather than feature units.
+    cartesian_admittance_mass: object = (1.0, 1.0, 1.0, 0.1, 0.1, 0.1)
+    cartesian_admittance_damping: object = (20.0, 20.0, 20.0, 2.0, 2.0, 2.0)
+    cartesian_admittance_stiffness: object = (500.0, 500.0, 500.0, 20.0, 20.0, 20.0)
+    cartesian_admittance_wrench_scale: object = 1.0
+    cartesian_admittance_max_offset: object = (0.03, 0.03, 0.03, 0.15, 0.15, 0.15)
+    cartesian_admittance_max_velocity: object = (0.10, 0.10, 0.10, 0.50, 0.50, 0.50)
+    cartesian_admittance_max_acceleration: object = (1.0, 1.0, 1.0, 5.0, 5.0, 5.0)
+
     enable_rtde_tcp_force: bool = True
     rtde_tcp_force_frame: str = "base"
     rtde_force_scale: float = 1.0
@@ -89,9 +101,11 @@ class PBVSConfig:
         self.kp = to_vec6(self.kp, "kp")
         self.kd = to_vec6(self.kd, "kd")
         self.controller_name = str(self.controller_name)
-        if self.controller_name not in ("cO", "cA"):
-            raise ValueError("controller_name must be 'cO' or 'cA'")
-        self.enable_feature_admittance = bool(self.enable_feature_admittance)
+        if self.controller_name not in ("cO", "cA", "cB"):
+            raise ValueError("controller_name must be 'cO', 'cA', or 'cB'")
+        # Controller names select exactly one admittance implementation.
+        self.enable_feature_admittance = self.controller_name == "cA"
+        self.enable_cartesian_admittance = self.controller_name == "cB"
         self.feature_admittance_mass = to_vec6(
             self.feature_admittance_mass, "feature_admittance_mass"
         )
@@ -123,6 +137,34 @@ class PBVSConfig:
         self.feature_admittance_mass = np.maximum(self.feature_admittance_mass, 1e-9)
         self.feature_admittance_damping = np.maximum(self.feature_admittance_damping, 0.0)
         self.feature_admittance_stiffness = np.maximum(self.feature_admittance_stiffness, 0.0)
+        self.cartesian_admittance_mass = np.maximum(
+            to_vec6(self.cartesian_admittance_mass, "cartesian_admittance_mass"), 1e-9
+        )
+        self.cartesian_admittance_damping = np.maximum(
+            to_vec6(self.cartesian_admittance_damping, "cartesian_admittance_damping"), 0.0
+        )
+        self.cartesian_admittance_stiffness = np.maximum(
+            to_vec6(self.cartesian_admittance_stiffness, "cartesian_admittance_stiffness"), 0.0
+        )
+        self.cartesian_admittance_wrench_scale = to_vec6(
+            self.cartesian_admittance_wrench_scale,
+            "cartesian_admittance_wrench_scale",
+        )
+        self.cartesian_admittance_max_offset = np.maximum(
+            to_vec6(self.cartesian_admittance_max_offset, "cartesian_admittance_max_offset"),
+            0.0,
+        )
+        self.cartesian_admittance_max_velocity = np.maximum(
+            to_vec6(self.cartesian_admittance_max_velocity, "cartesian_admittance_max_velocity"),
+            0.0,
+        )
+        self.cartesian_admittance_max_acceleration = np.maximum(
+            to_vec6(
+                self.cartesian_admittance_max_acceleration,
+                "cartesian_admittance_max_acceleration",
+            ),
+            0.0,
+        )
         self.enable_rtde_tcp_force = bool(self.enable_rtde_tcp_force)
         self.rtde_tcp_force_frame = str(self.rtde_tcp_force_frame).lower()
         if self.rtde_tcp_force_frame not in ("base", "tcp"):
