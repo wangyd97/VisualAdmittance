@@ -1,8 +1,8 @@
+#visual-admittance controller, notice that here we use position-based visual servoing (PBVS) but not image-based visual servoing(IBVS).
+import numpy as np
 import argparse
 import sys
 from pathlib import Path
-
-import numpy as np
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -20,7 +20,7 @@ APRILTAG_NTHREADS = 2
 APRILTAG_QUAD_DECIMATE = 2.0
 
 ROBOT_IP = "10.31.17.47"
-
+  
 
 def hand_eye_matrix() -> np.ndarray:
     return np.array([
@@ -34,13 +34,13 @@ def hand_eye_matrix() -> np.ndarray:
 def controller_params() -> dict:
     return dict(
         controller_mode="SOPD",
-        kp=350 * np.ones(6),
+        kp=100 * np.ones(6),
         kd=80 * np.ones(6),
         max_linear_vel=float("inf"),
         max_angular_vel=float("inf"),
         feature_admittance_mass= 1.0,
-        feature_admittance_damping= 200.0,
-        feature_admittance_stiffness= 1250.0,
+        feature_admittance_damping= 20.0,
+        feature_admittance_stiffness= 500.0,
     )
 
 
