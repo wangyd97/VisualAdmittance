@@ -18,10 +18,10 @@ python e2\main.py --controller cB
 measured wrench -> Cartesian admittance -> proxy camera pose -> PBVS/SOPD
 ```
 
-Its Cartesian offset, velocity, and acceleration are saved as
+<!-- Its Cartesian offset, velocity, and acceleration are saved as
 `cart_offset0..5`, `cart_velocity0..5`, and `cart_acceleration0..5` in
 `e2/data/log_cB.csv`.  The existing `s`, `sp`, and `sd` columns remain
-available so that controller results can be plotted with the same tools.
+available so that controller results can be plotted with the same tools. -->
 
 The runtime uses two rates: a background RealSense/AprilTag worker updates
 the object estimate at the camera rate (60 Hz), while the RTDE loop reads

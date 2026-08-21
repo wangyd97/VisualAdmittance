@@ -41,9 +41,11 @@ def controller_params() -> dict:
         feature_admittance_mass= 1.0,
         feature_admittance_damping= 20.0,
         feature_admittance_stiffness= 500.0,
+        feature_admittance_max_offset=(float("inf"),) * 6,
         cartesian_admittance_mass=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
         cartesian_admittance_damping=(20.0, 20.0, 20.0, 20.0, 20.0, 20.0),
         cartesian_admittance_stiffness=(500.0, 500.0, 500.0, 500.0, 500.0, 500.0),
+        cartesian_admittance_max_offset=(float("inf"),) * 6,
     )
 
 

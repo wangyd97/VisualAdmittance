@@ -235,7 +235,7 @@ class PBVSController:
         self.rtde_r = RTDEReceive(
             robot_ip, self.rtde_freq,
             receive_vars,
-            True, False, 60
+            True, False, 200
         )
         self.estimator = AprilTagEstimator(self.cfg, intrinsics)
 
