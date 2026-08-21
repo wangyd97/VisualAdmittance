@@ -34,16 +34,16 @@ def hand_eye_matrix() -> np.ndarray:
 def controller_params() -> dict:
     return dict(
         controller_mode="SOPD",
-        kp=100 * np.ones(6),
-        kd=80 * np.ones(6),
+        kp=500 * np.ones(6),
+        kd=150 * np.ones(6),
         max_linear_vel=float("inf"),
         max_angular_vel=float("inf"),
         feature_admittance_mass= 1.0,
         feature_admittance_damping= 20.0,
         feature_admittance_stiffness= 500.0,
-        cartesian_admittance_mass=(1.0, 1.0, 1.0, 0.1, 0.1, 0.1),
-        cartesian_admittance_damping=(20.0, 20.0, 20.0, 2.0, 2.0, 2.0),
-        cartesian_admittance_stiffness=(500.0, 500.0, 500.0, 20.0, 20.0, 20.0),
+        cartesian_admittance_mass=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+        cartesian_admittance_damping=(20.0, 20.0, 20.0, 20.0, 20.0, 20.0),
+        cartesian_admittance_stiffness=(500.0, 500.0, 500.0, 500.0, 500.0, 500.0),
     )
 
 
@@ -66,10 +66,10 @@ def build_config(args) -> PBVSConfig:
         # cB directly converts physical wrench into a Cartesian pose offset.
         # Keep finite command limits while validating it on hardware.
         params.update(
-            accel_limit_pos=1.0,
-            accel_limit_rot=5.0,
-            max_linear_vel=0.10,
-            max_angular_vel=0.50,
+            accel_limit_pos=float("inf"),
+            accel_limit_rot=float("inf"),
+            max_linear_vel=float("inf"),
+            max_angular_vel=float("inf"),
         )
 
     return PBVSConfig(

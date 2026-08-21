@@ -1,4 +1,5 @@
 ﻿import csv
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -243,6 +244,8 @@ class PBVSController:
         self.cur_target_idx = 0
 
         self._last_accel_saturated = False
+        self._last_command_timestamp: Optional[float] = None
+        self._instant_control_hz = float("nan")
 
         self.stable_cnt = 0
         self._u_c_integrated = np.zeros(6)
@@ -275,6 +278,11 @@ class PBVSController:
         self._s_lowpass: Optional[np.ndarray] = None
         self._tcp_pose_cmd_est: Optional[np.ndarray] = None
         self._R_base_cam_lowpass: Optional[np.ndarray] = None
+        self._vision_lock = threading.Lock()
+        self._vision_stop_event = threading.Event()
+        self._latest_vision_sample = None
+        self._vision_error: Optional[BaseException] = None
+        self._last_vision_age = float("inf")
 
     def set_targets(self, targets: List[TargetPose]):
         self.targets = targets
@@ -311,6 +319,9 @@ class PBVSController:
         self._tcp_pose_cmd_est = None
         self._R_base_cam_lowpass = None
         self._last_accel_saturated = False
+        self._last_command_timestamp = None
+        self._instant_control_hz = float("nan")
+        self._last_vision_age = float("inf")
 
     def _desired_T(self) -> np.ndarray:
         if self.cur_target is not None:
@@ -584,6 +595,67 @@ class PBVSController:
         self._R_base_cam_lowpass = R_filtered.copy()
         return R_filtered
 
+    def _base_camera_pose(
+            self, tcp_pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return b_T_c and b_R_c using the configured rotation filter."""
+        tcp_pose = np.asarray(tcp_pose, dtype=float).reshape(6)
+        R_base_tcp = matrix_from_rotvec(tcp_pose[3:])
+        R_base_cam = self._filter_R_base_cam(R_base_tcp @ self.e_R_c)
+
+        T_base_tcp = np.eye(4)
+        T_base_tcp[:3, :3] = R_base_tcp
+        T_base_tcp[:3, 3] = tcp_pose[:3]
+        T_base_cam = T_base_tcp @ self.e_T_c
+        # The product above contains the unfiltered rotation. Replace only its
+        # rotation block so the full pose and R_base_cam stay consistent.
+        T_base_cam[:3, :3] = R_base_cam
+        return T_base_cam, R_base_cam
+
+    def _vision_worker(self, pipeline):
+        """Acquire images and estimate AprilTag pose independently of RTDE."""
+        frame_index = 0
+        cached_detection = None
+        try:
+            while not self._vision_stop_event.is_set():
+                frames = pipeline.wait_for_frames()
+                if self._vision_stop_event.is_set():
+                    break
+                color_frame = frames.get_color_frame()
+                if not color_frame:
+                    continue
+
+                # Own the image memory after the RealSense frame is released.
+                image = np.asanyarray(color_frame.get_data()).copy()
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                should_detect = (
+                    cached_detection is None
+                    or frame_index % self.cfg.detect_stride == 0
+                )
+                detection_updated = False
+                if should_detect:
+                    cached_detection = self.estimator.detect(gray)
+                    detection_updated = True
+                    if cached_detection[0] is None:
+                        cached_detection = None
+
+                sample = {
+                    "sequence": frame_index,
+                    "timestamp": time.perf_counter(),
+                    "image": image,
+                    "detection": cached_detection,
+                    "detection_updated": detection_updated,
+                }
+                with self._vision_lock:
+                    self._latest_vision_sample = sample
+                frame_index += 1
+        except BaseException as exc:
+            with self._vision_lock:
+                self._vision_error = exc
+
+    def _latest_vision(self):
+        with self._vision_lock:
+            return self._latest_vision_sample, self._vision_error
+
     def _reset_force_bias(self, manual: bool = False):
         self._force_bias = np.zeros(6)
         self._force_bias_ready = self.cfg.rtde_force_bias_samples <= 0
@@ -689,12 +761,19 @@ class PBVSController:
             return detection
         return self._last_detection
 
-    def process_step(self, gray_img, tcp_pose: np.ndarray = None,
+    def process_step(self, gray_img=None, tcp_pose: np.ndarray = None,
                      log_tcp_pose: np.ndarray = None,
                      external_wrench_cam: np.ndarray = None,
                      rtde_wrench_tcp: np.ndarray = None,
-                     feature_force: np.ndarray = None):
-        T_cur, corners, R_cur, t_cur = self._detect_or_reuse_tag(gray_img)
+                     feature_force: np.ndarray = None,
+                     detection=None,
+                     T_base_cam: np.ndarray = None,
+                     R_base_cam: np.ndarray = None):
+        if detection is None:
+            if gray_img is None:
+                raise ValueError("gray_img or a precomputed detection is required")
+            detection = self._detect_or_reuse_tag(gray_img)
+        T_cur, corners, R_cur, t_cur = detection
         
         if T_cur is None:
             self._last_u_c = np.zeros(6)
@@ -710,15 +789,9 @@ class PBVSController:
             np.asarray(log_tcp_pose, dtype=float)
             if log_tcp_pose is not None else actual_pose
         )
-        R_base_tcp = matrix_from_rotvec(actual_pose[3:])
-        R_base_cam = R_base_tcp @ self.e_R_c
-        R_base_cam = self._filter_R_base_cam(R_base_cam)
+        if T_base_cam is None or R_base_cam is None:
+            T_base_cam, R_base_cam = self._base_camera_pose(actual_pose)
         self._last_R_base_cam = R_base_cam.copy()
-        T_base_tcp = np.eye(4)
-        T_base_tcp[:3, :3] = R_base_tcp
-        T_base_tcp[:3, 3] = actual_pose[:3]
-        T_base_cam = T_base_tcp @ self.e_T_c
-        T_base_cam[:3, :3] = R_base_cam
         if external_wrench_cam is None:
             external_wrench_cam = self._tcp_wrench_to_camera(
                 rtde_wrench_tcp,
@@ -793,6 +866,8 @@ class PBVSController:
                 "controller": controller_name,
                 "controller_mode": mode,
                 "accel_saturated": int(self._last_accel_saturated),
+                "control_hz": float(self._instant_control_hz),
+                "vision_age_ms": float(self._last_vision_age * 1000.0),
                 "tcp_x": float(logged_pose[0]),
                 "tcp_y": float(logged_pose[1]),
                 "tcp_z": float(logged_pose[2]),
@@ -848,7 +923,7 @@ class PBVSController:
             writer.writerows(self._error_log)
         print(f"Log saved: {log_path}")
 
-    def run(self, pipeline, init_pose, move_acc: float = 5.0):
+    def run(self, pipeline, init_pose, move_acc: float = 8.0):
         if not self.targets:
             print("Nothing detected!")
             return
@@ -863,6 +938,24 @@ class PBVSController:
         self._error_log.clear()
         self._frame_idx = 0
 
+        with self._vision_lock:
+            self._latest_vision_sample = None
+            self._vision_error = None
+        self._vision_stop_event.clear()
+        vision_thread = threading.Thread(
+            target=self._vision_worker,
+            args=(pipeline,),
+            name="AprilTagVision",
+            daemon=True,
+        )
+        vision_thread.start()
+
+        last_vision_sequence = -1
+        latest_target_timestamp: Optional[float] = None
+        latest_T_base_object: Optional[np.ndarray] = None
+        latest_corners = None
+        command_active = False
+
         try:
             while True:
                 now = time.time()
@@ -871,47 +964,137 @@ class PBVSController:
                     break
 
                 t_start = self.rtde_c.initPeriod()
-                frames = pipeline.wait_for_frames()
-                cf = frames.get_color_frame()
-                if not cf:
-                    continue
-                img = np.asanyarray(cf.get_data())
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
                 try:
                     tcp_pose_now = np.array(self.rtde_r.getActualTCPPose())
                 except Exception:
                     tcp_pose_now = None
                 tcp_pose_ctrl = self._control_tcp_pose(tcp_pose_now)
+
+                T_base_cam = None
+                R_base_cam = None
+                if tcp_pose_ctrl is not None:
+                    T_base_cam, R_base_cam = self._base_camera_pose(tcp_pose_ctrl)
+
                 wrench_raw = self._read_rtde_tcp_force()
                 rtde_wrench_tcp = self._update_force_bias_and_filter(wrench_raw)
-                print(rtde_wrench_tcp,'\n')
-                v_cmd, errs, converged, corners, R_cur, t_cur = self.process_step(
-                    gray,
-                    tcp_pose=tcp_pose_ctrl,
-                    log_tcp_pose=tcp_pose_now,
-                    rtde_wrench_tcp=rtde_wrench_tcp,
+
+                vision_sample, vision_error = self._latest_vision()
+                if vision_error is not None:
+                    raise RuntimeError("Vision worker failed") from vision_error
+
+                new_vision_sample = (
+                    vision_sample is not None
+                    and vision_sample["sequence"] != last_vision_sequence
                 )
+                if new_vision_sample:
+                    last_vision_sequence = vision_sample["sequence"]
+                    detection = vision_sample["detection"]
+                    if vision_sample["detection_updated"]:
+                        if detection is not None and T_base_cam is not None:
+                            latest_T_base_object = T_base_cam @ detection[0]
+                            latest_target_timestamp = vision_sample["timestamp"]
+                            latest_corners = detection[1].copy()
+                        else:
+                            latest_T_base_object = None
+                            latest_target_timestamp = None
+                            latest_corners = None
+
+                control_timestamp = time.perf_counter()
+                if latest_target_timestamp is None:
+                    self._last_vision_age = float("inf")
+                else:
+                    self._last_vision_age = max(
+                        0.0, control_timestamp - latest_target_timestamp
+                    )
+                vision_fresh = (
+                    latest_T_base_object is not None
+                    and T_base_cam is not None
+                    and self._last_vision_age <= self.cfg.vision_stale_timeout
+                )
+
+                v_cmd = None
+                errs = None
+                converged = False
+                if vision_fresh:
+                    T_current = inv_T(T_base_cam) @ latest_T_base_object
+                    detection_for_control = (
+                        T_current,
+                        latest_corners,
+                        T_current[:3, :3],
+                        T_current[:3, 3],
+                    )
+                    v_cmd, errs, converged, _, _, _ = self.process_step(
+                        tcp_pose=tcp_pose_ctrl,
+                        log_tcp_pose=tcp_pose_now,
+                        rtde_wrench_tcp=rtde_wrench_tcp,
+                        detection=detection_for_control,
+                        T_base_cam=T_base_cam,
+                        R_base_cam=R_base_cam,
+                    )
 
                 if v_cmd is not None:
                     self.rtde_c.speedL(v_cmd, move_acc, self.dt)
+                    command_active = True
+                    command_timestamp = time.perf_counter()
+                    if self._last_command_timestamp is not None:
+                        command_period = (
+                            command_timestamp - self._last_command_timestamp
+                        )
+                        self._instant_control_hz = (
+                            1.0 / max(command_period, 1e-9)
+                        )
+                    self._last_command_timestamp = command_timestamp
                     self._advance_commanded_tcp_pose(v_cmd)
                     if self._frame_idx % self.cfg.status_print_interval == 0:
                         status = "CONVERGED" if converged else "Running"
                         ep, er = errs
                         sat_s = "SAT" if self._last_accel_saturated else "---"
+                        hz_s = (
+                            f"{self._instant_control_hz:.1f}Hz"
+                            if np.isfinite(self._instant_control_hz)
+                            else "--.-Hz"
+                        )
                         print(f"\r[{controller_name}] "
                               f"{self.cur_target.name} | "
                               f"P:{ep*1000:.1f}mm R:{np.rad2deg(er):.1f}deg"
-                              f" | [{sat_s}] {status}   ", end="", flush=True)
+                              f" | Ctrl:{hz_s} [{sat_s}] {status}   ",
+                              end="", flush=True)
                 else:
-                    self.rtde_c.speedStop()
+                    if command_active:
+                        self.rtde_c.speedStop()
+                        self._u_c_integrated[:] = 0.0
+                        self._last_u_c[:] = 0.0
+                    command_active = False
+                    self._last_command_timestamp = None
+                    self._instant_control_hz = float("nan")
                     if self._frame_idx % self.cfg.status_print_interval == 0:
-                        print("\rTag lost...                                ", end="", flush=True)
+                        age_s = (
+                            f"{self._last_vision_age * 1000.0:.0f}ms"
+                            if np.isfinite(self._last_vision_age)
+                            else "unavailable"
+                        )
+                        print(
+                            f"\rTag unavailable/stale ({age_s})...          ",
+                            end="",
+                            flush=True,
+                        )
+                    self._frame_idx += 1
 
-                if (self.cfg.enable_visualization
-                        and self._frame_idx % self.cfg.visualization_stride == 0):
-                    self._visualize(img, corners, v_cmd, R_cur, t_cur)
+                if (self.cfg.enable_visualization and new_vision_sample
+                        and (vision_sample["sequence"]
+                             % self.cfg.visualization_stride == 0)):
+                    display_detection = vision_sample["detection"]
+                    if display_detection is None:
+                        display_corners = display_R = display_t = None
+                    else:
+                        _, display_corners, display_R, display_t = display_detection
+                    self._visualize(
+                        vision_sample["image"],
+                        display_corners,
+                        v_cmd,
+                        display_R,
+                        display_t,
+                    )
 
                 key = cv2.waitKey(1) & 0xFF if self.cfg.enable_visualization else 0
                 if key == ord('q'):
@@ -928,6 +1111,8 @@ class PBVSController:
             print("\nInterrupted by user.")
         finally:
             self.rtde_c.speedStop()
+            self._vision_stop_event.set()
+            vision_thread.join(timeout=1.0)
             self.rtde_c.stopScript()
             print("\nControl stopped.")
             self.save_log_csv()

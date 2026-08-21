@@ -14,6 +14,9 @@ class PBVSConfig:
     apriltag_quad_sigma: float = 0.4
     enable_visualization: bool = True
     visualization_stride: int = 1
+    # Stop robot commands when no successful AprilTag update has arrived
+    # within this many seconds.
+    vision_stale_timeout: float = 0.10
 
     pos_threshold: float = 0.005
     rot_threshold: float = 0.02
@@ -85,6 +88,7 @@ class PBVSConfig:
         self.apriltag_quad_decimate = max(1.0, float(self.apriltag_quad_decimate))
         self.apriltag_quad_sigma = max(0.0, float(self.apriltag_quad_sigma))
         self.visualization_stride = max(1, int(self.visualization_stride))
+        self.vision_stale_timeout = max(0.0, float(self.vision_stale_timeout))
         self.slow_after_convergence = bool(self.slow_after_convergence)
         self.convergence_slowdown_frames = max(0, int(self.convergence_slowdown_frames))
         self.convergence_velocity_scale = float(np.clip(self.convergence_velocity_scale, 0.0, 1.0))
