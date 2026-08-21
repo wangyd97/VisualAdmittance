@@ -52,6 +52,15 @@ def controller_params() -> dict:
 def build_config(args) -> PBVSConfig:
     project_dir = Path(__file__).resolve().parent
     data_dir = project_dir / "data"
+    gravity_model_path = Path(args.gravity_model)
+    gravity_compensation_enabled = (
+        not args.no_gravity_compensation and gravity_model_path.is_file()
+    )
+    if not args.no_gravity_compensation and not gravity_compensation_enabled:
+        print(
+            f"Static gravity model not found: {gravity_model_path}. "
+            "Running with the legacy single-pose force zero."
+        )
     controller_name = args.controller
     enable_feature_admittance = controller_name == "cA"
     enable_cartesian_admittance = controller_name == "cB"
@@ -88,6 +97,8 @@ def build_config(args) -> PBVSConfig:
         log_save_path=str(data_dir / f"log_{controller_name}.csv"),
         enable_memory_log=ENABLE_MEMORY_LOG,
         status_print_interval=STATUS_PRINT_INTERVAL,
+        enable_static_gravity_compensation=gravity_compensation_enabled,
+        static_gravity_model_path=str(gravity_model_path),
         controller_name=controller_name,
         enable_feature_admittance=enable_feature_admittance,
         enable_cartesian_admittance=enable_cartesian_admittance,
@@ -129,6 +140,17 @@ def main():
         type=float,
         default=8.0,
         help="Recording duration in seconds. Use 0 for manual stop.",
+    )
+    parser.add_argument(
+        "--gravity-model",
+        type=Path,
+        default=Path(__file__).resolve().parent / "data" / "static_gravity_model.json",
+        help="Offline-identified static wrench compensation model.",
+    )
+    parser.add_argument(
+        "--no-gravity-compensation",
+        action="store_true",
+        help="Disable the static gravity model even if the model file exists.",
     )
     args = parser.parse_args()
 

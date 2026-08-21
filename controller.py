@@ -17,6 +17,7 @@ from .geometry import (
     inv_T,
     project_3d_to_2d,
 )
+from .gravity_compensation import StaticGravityCompensator
 from .Mathematic import (
     euler_xyz_from_matrix,
     matrix_from_quat,
@@ -268,11 +269,22 @@ class PBVSController:
         self._last_s_p_ddot = np.zeros(6)
         self._last_cartesian_proxy_quat: Optional[np.ndarray] = None
         self._force_bias = np.zeros(6)
+        self._static_gravity_compensator: Optional[StaticGravityCompensator] = None
+        if self.cfg.enable_static_gravity_compensation:
+            self._static_gravity_compensator = StaticGravityCompensator.load(
+                self.cfg.static_gravity_model_path
+            )
+            print(
+                "Static gravity compensation loaded: "
+                f"{self.cfg.static_gravity_model_path}"
+            )
         self._force_bias_ready = self.cfg.rtde_force_bias_samples <= 0
         self._force_bias_count = 0
         self._force_zero_pending = False
         self._force_lowpass = np.zeros(6)
         self._last_wrench_tcp_raw = np.full(6, float("nan"))
+        self._last_static_wrench = np.zeros(6)
+        self._last_wrench_static_compensated = np.full(6, float("nan"))
         self._last_wrench_tcp = np.full(6, float("nan"))
         self._last_wrench_cam = np.full(6, float("nan"))
         self._s_lowpass: Optional[np.ndarray] = None
@@ -313,6 +325,8 @@ class PBVSController:
         self._last_cartesian_proxy_quat = None
         self._force_lowpass = np.zeros(6)
         self._last_wrench_tcp_raw = np.full(6, float("nan"))
+        self._last_static_wrench = np.zeros(6)
+        self._last_wrench_static_compensated = np.full(6, float("nan"))
         self._last_wrench_tcp = np.full(6, float("nan"))
         self._last_wrench_cam = np.full(6, float("nan"))
         self._s_lowpass = None
@@ -665,11 +679,17 @@ class PBVSController:
         self._last_wrench_tcp = np.zeros(6)
         self._last_wrench_cam = np.full(6, float("nan"))
         if manual:
+            zero_target = (
+                "gravity-compensated residual"
+                if self._static_gravity_compensator is not None
+                else "raw wrench"
+            )
             if self._force_bias_ready:
-                print("\nForce sensor bias set to zero (bias sampling disabled).")
+                print(f"\nForce sensor {zero_target} bias set to zero (sampling disabled).")
             else:
                 print(
-                    f"\nForce sensor zeroing started: keep the tool unloaded "
+                    f"\nForce sensor {zero_target} zeroing started: keep the tool free "
+                    f"of external contact "
                     f"for {self.cfg.rtde_force_bias_samples} samples."
                 )
 
@@ -683,14 +703,28 @@ class PBVSController:
         self._last_wrench_tcp_raw = wrench.copy()
         return wrench
 
-    def _update_force_bias_and_filter(self, wrench_raw: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    def _update_force_bias_and_filter(
+            self,
+            wrench_raw: Optional[np.ndarray],
+            tcp_pose: Optional[np.ndarray]) -> Optional[np.ndarray]:
         if wrench_raw is None:
             self._last_wrench_tcp = np.full(6, float("nan"))
             return None
 
         wrench_raw = np.asarray(wrench_raw, dtype=float).reshape(6)
+        static_wrench = np.zeros(6)
+        if self._static_gravity_compensator is not None:
+            if tcp_pose is None:
+                self._last_wrench_tcp = np.full(6, float("nan"))
+                return None
+            static_wrench = self._static_gravity_compensator.predict(tcp_pose)
+        wrench_static_compensated = wrench_raw - static_wrench
+        self._last_static_wrench = static_wrench.copy()
+        self._last_wrench_static_compensated = wrench_static_compensated.copy()
         if not self._force_bias_ready:
-            self._force_bias += wrench_raw
+            # With a model loaded, z estimates only the residual electronics /
+            # model bias.  It no longer absorbs gravity at the current attitude.
+            self._force_bias += wrench_static_compensated
             self._force_bias_count += 1
             if self._force_bias_count >= self.cfg.rtde_force_bias_samples:
                 self._force_bias /= max(self._force_bias_count, 1)
@@ -702,7 +736,9 @@ class PBVSController:
             self._last_wrench_tcp = np.zeros(6)
             return None
 
-        wrench = self.cfg.rtde_force_scale * (wrench_raw - self._force_bias)
+        wrench = self.cfg.rtde_force_scale * (
+            wrench_static_compensated - self._force_bias
+        )
         deadband = np.asarray(self.cfg.rtde_force_deadband, dtype=float).reshape(6)
         wrench = np.sign(wrench) * np.maximum(np.abs(wrench) - deadband, 0.0)
         if self.cfg.rtde_force_lowpass_tau > 0.0:
@@ -892,6 +928,10 @@ class PBVSController:
                 row[f"uc{i}"] = float(u_c[i])
                 row[f"udotc{i}"] = float(u_dot_c[i])
                 row[f"tcp_force_raw{i}"] = float(self._last_wrench_tcp_raw[i])
+                row[f"static_wrench{i}"] = float(self._last_static_wrench[i])
+                row[f"tcp_force_static_comp{i}"] = float(
+                    self._last_wrench_static_compensated[i]
+                )
                 row[f"tcp_force{i}"] = float(self._last_wrench_tcp[i])
                 row[f"cam_force{i}"] = float(self._last_wrench_cam[i])
                 row[f"cart_offset{i}"] = float(self._cartesian_admittance.offset[i])
@@ -976,7 +1016,9 @@ class PBVSController:
                     T_base_cam, R_base_cam = self._base_camera_pose(tcp_pose_ctrl)
 
                 wrench_raw = self._read_rtde_tcp_force()
-                rtde_wrench_tcp = self._update_force_bias_and_filter(wrench_raw)
+                rtde_wrench_tcp = self._update_force_bias_and_filter(
+                    wrench_raw, tcp_pose_now
+                )
 
                 vision_sample, vision_error = self._latest_vision()
                 if vision_error is not None:
@@ -1247,7 +1289,12 @@ class PBVSController:
             force_status = "Force-Zero: disabled"
             force_color = (140, 140, 140)
         elif self._force_bias_ready:
-            force_status = "Force-Zero: READY [z]"
+            gravity_status = (
+                "Gravity: ON"
+                if self._static_gravity_compensator is not None
+                else "Gravity: OFF"
+            )
+            force_status = f"Force-Zero: READY [z]  {gravity_status}"
             force_color = (0, 200, 80)
         else:
             force_status = (

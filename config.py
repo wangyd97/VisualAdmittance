@@ -65,6 +65,8 @@ class PBVSConfig:
     enable_rtde_tcp_force: bool = True
     rtde_tcp_force_frame: str = "base"
     rtde_force_scale: float = 1.0
+    enable_static_gravity_compensation: bool = False
+    static_gravity_model_path: str = ""
     rtde_force_bias_samples: int = 30
     rtde_force_lowpass_tau: float = 0.05
     # Soft deadband [N, N, N, Nm, Nm, Nm], applied after bias removal.
@@ -174,6 +176,15 @@ class PBVSConfig:
         if self.rtde_tcp_force_frame not in ("base", "tcp"):
             raise ValueError("rtde_tcp_force_frame must be 'base' or 'tcp'")
         self.rtde_force_scale = float(self.rtde_force_scale)
+        self.enable_static_gravity_compensation = bool(
+            self.enable_static_gravity_compensation
+        )
+        self.static_gravity_model_path = str(self.static_gravity_model_path)
+        if self.enable_static_gravity_compensation and not self.static_gravity_model_path:
+            raise ValueError(
+                "static_gravity_model_path is required when static gravity "
+                "compensation is enabled"
+            )
         self.rtde_force_bias_samples = max(0, int(self.rtde_force_bias_samples))
         self.rtde_force_lowpass_tau = max(0.0, float(self.rtde_force_lowpass_tau))
         self.rtde_force_deadband = np.maximum(
