@@ -23,17 +23,36 @@ measured wrench -> Cartesian admittance -> proxy camera pose -> PBVS/SOPD
 `e2/data/log_cB.csv`.  The existing `s`, `sp`, and `sd` columns remain
 available so that controller results can be plotted with the same tools. -->
 
-The runtime uses two rates: a background RealSense/AprilTag worker updates
-the object estimate at the camera rate (60 Hz), while the RTDE loop reads
-wrench data, updates admittance, and sends `speedL` commands at 200 Hz.  The
-RTDE loop reconstructs the camera-to-object pose from the latest base-frame
-object estimate and the current robot pose.  Commands stop when the last
-successful tag estimate is older than `vision_stale_timeout`.
+The runtime is split into three independent execution chains:
+
+1. `AprilTagVision` owns RealSense capture and AprilTag detection at the camera
+   rate.
+2. The RTDE chain reads robot pose, speed, and wrench; applies gravity
+   compensation, force filtering, EKF prediction, admittance, and PBVS; then
+   sends `speedL` commands at 200 Hz.
+3. `OpenCVDisplay` renders the overlay and owns `imshow`/`waitKey` without
+   running GUI work in the RTDE chain.
+
+Vision and display exchange latest-only snapshots instead of queues. If
+detection or rendering is slower than its producer, an old sample is replaced
+rather than accumulated, so neither chain applies back-pressure to the RTDE
+control loop. The RTDE loop reconstructs the camera-to-object pose from the
+latest estimate and current robot pose. Commands stop when the last successful
+tag estimate is older than `vision_stale_timeout`. Display key presses are
+forwarded as events: `q` requests a safe stop and `z` requests force zeroing in
+the RTDE chain.
 
 ## High-rate PBVS EKF and moving targets
 
-The controller enables an 18-state PBVS EKF by default, following the process
-model in Oliva et al., ICRA 2022:
+The controller provides an optional 18-state PBVS EKF, following the process
+model in Oliva et al., ICRA 2022. It is disabled by default and enabled with
+`--ekf`:
+
+```powershell
+python e2\main.py --controller cB --ekf
+```
+
+Its process model is:
 
 ```text
 x = [s, object twist u_o, object acceleration u_o_dot]
@@ -48,19 +67,22 @@ timestamps are kept separate; delayed measurements update a buffered EKF state
 and the stored 200 Hz predictions are replayed to the present. The resulting
 high-rate feature estimate is used as `s`. Estimated object twist `u_o` is used
 in the error derivative through `N*u_o`, and `N*u_o_dot` is compensated in the
-SOPD acceleration command. Motion compensation is smoothly enabled after the first accepted
-measurements to avoid a startup acceleration transient. The old
-stationary-target reconstruction remains available with:
-
-```powershell
-python e2\main.py --controller cB --no-pbvs-ekf
-```
+SOPD acceleration command. Motion compensation is smoothly enabled after the
+first accepted measurements to avoid a startup acceleration transient. Without
+`--ekf`, the controller uses the stationary-target reconstruction.
 
 Logs include `vision_s0..5`, `object_twist0..5`,
 `object_acceleration0..5`, the corresponding unscaled
 `ekf_object_*_raw0..5`,
 `ekf_motion_compensation_scale`, `ekf_innovation_norm`, and `ekf_nis` for
 tuning and comparison.
+
+The visualization reports three independently measured instantaneous rates:
+`Total` is the RTDE main-loop rate, `Vision` is the valid AprilTag pose rate,
+and `Force` is the rate at which a valid wrench is consumed by the cA/cB
+admittance and control update. They are also logged as `total_hz`, `vision_hz`,
+and `force_control_hz`; the older `control_hz` column remains the `speedL`
+command-send rate.
 
 ## Static gravity compensation
 
@@ -76,7 +98,7 @@ Use pendant freedrive to place the robot, release it, and press Enter to record
 each attitude. Press `f` to fit and save
 `e2/data/static_gravity_model.json`. Do not touch the tool during a capture.
 The normal controller automatically loads this file on its next start. Use
-`--no-gravity-compensation` to bypass it for a comparison run.
+`--no-gravity` to bypass it for a comparison run.
 
 The fitted model predicts the no-contact static RTDE wrench from the TCP
 rotation. Runtime processing subtracts this prediction before the deadband

@@ -230,7 +230,7 @@ class PBVSController:
         # e_T_c contains e_p_ce = p_c - p_e expressed in frame e.
         # Use p_ec = p_e - p_c to match the manuscript convention.
         self.e_p_ec = -self.e_T_c[:3, 3]
-        self.rtde_freq = 200.0
+        self.rtde_freq = 1000.0
         self.dt = 1.0 / self.rtde_freq
 
         self.rtde_c = RTDEControl(robot_ip, self.rtde_freq)
@@ -238,7 +238,7 @@ class PBVSController:
         self.rtde_r = RTDEReceive(
             robot_ip, self.rtde_freq,
             receive_vars,
-            True, False, 200
+            True, False, 1000
         )
         self.estimator = AprilTagEstimator(self.cfg, intrinsics)
 
@@ -249,6 +249,12 @@ class PBVSController:
         self._last_accel_saturated = False
         self._last_command_timestamp: Optional[float] = None
         self._instant_control_hz = float("nan")
+        self._last_loop_timestamp: Optional[float] = None
+        self._last_visual_measurement_timestamp: Optional[float] = None
+        self._last_force_control_timestamp: Optional[float] = None
+        self._instant_total_hz = float("nan")
+        self._instant_vision_hz = float("nan")
+        self._instant_force_control_hz = float("nan")
 
         self.stable_cnt = 0
         self._u_c_integrated = np.zeros(6)
@@ -301,6 +307,13 @@ class PBVSController:
         self._vision_stop_event = threading.Event()
         self._latest_vision_sample = None
         self._vision_error: Optional[BaseException] = None
+        self._display_lock = threading.Lock()
+        self._display_update_event = threading.Event()
+        self._display_stop_event = threading.Event()
+        self._display_quit_event = threading.Event()
+        self._force_zero_event = threading.Event()
+        self._latest_display_snapshot = None
+        self._display_error: Optional[BaseException] = None
         self._last_vision_age = float("inf")
 
     def set_targets(self, targets: List[TargetPose]):
@@ -347,6 +360,12 @@ class PBVSController:
         self._last_accel_saturated = False
         self._last_command_timestamp = None
         self._instant_control_hz = float("nan")
+        self._last_loop_timestamp = None
+        self._last_visual_measurement_timestamp = None
+        self._last_force_control_timestamp = None
+        self._instant_total_hz = float("nan")
+        self._instant_vision_hz = float("nan")
+        self._instant_force_control_hz = float("nan")
         self._last_vision_age = float("inf")
 
     def _desired_T(self) -> np.ndarray:
@@ -757,6 +776,73 @@ class PBVSController:
         with self._vision_lock:
             return self._latest_vision_sample, self._vision_error
 
+    def _publish_display_snapshot(
+            self, vision_sample, corners, R_cur, t_cur) -> None:
+        """Publish one immutable, latest-only snapshot for the GUI thread."""
+        target = self.cur_target
+        snapshot = {
+            "sequence": int(vision_sample["sequence"]),
+            # The vision worker owns this immutable image buffer. Rendering
+            # starts from image.copy(), so publishing the reference is safe and
+            # avoids a full image copy in the RTDE thread.
+            "image": vision_sample["image"],
+            "corners": None if corners is None else np.asarray(corners).copy(),
+            "R_cur": None if R_cur is None else np.asarray(R_cur).copy(),
+            "t_cur": None if t_cur is None else np.asarray(t_cur).copy(),
+            "K": self.estimator.K.copy(),
+            "controller_name": self.cfg.controller_name,
+            "target_name": "" if target is None else target.name,
+            "desired_T": self._desired_T().copy(),
+            "tag_size": float(self.cfg.tag_size),
+            "s_p": self._last_s_p.copy(),
+            "wrench_cam": self._last_wrench_cam.copy(),
+            "enable_force": bool(self.cfg.enable_rtde_tcp_force),
+            "force_bias_ready": bool(self._force_bias_ready),
+            "force_bias_count": int(self._force_bias_count),
+            "force_bias_samples": int(self.cfg.rtde_force_bias_samples),
+            "gravity_enabled": self._static_gravity_compensator is not None,
+            "accel_saturated": bool(self._last_accel_saturated),
+            "total_hz": float(self._instant_total_hz),
+            "vision_hz": float(self._instant_vision_hz),
+            "force_control_hz": float(self._instant_force_control_hz),
+        }
+        with self._display_lock:
+            # Replacing, rather than appending, guarantees that a slow GUI can
+            # never build a backlog or exert back-pressure on control.
+            self._latest_display_snapshot = snapshot
+            self._display_update_event.set()
+
+    def _display_worker(self) -> None:
+        """Render the newest snapshot and own all OpenCV HighGUI calls."""
+        last_sequence = -1
+        try:
+            while not self._display_stop_event.is_set():
+                self._display_update_event.wait(timeout=0.10)
+                if self._display_stop_event.is_set():
+                    break
+                with self._display_lock:
+                    self._display_update_event.clear()
+                    snapshot = self._latest_display_snapshot
+                if snapshot is not None and snapshot["sequence"] != last_sequence:
+                    last_sequence = snapshot["sequence"]
+                    self._visualize(snapshot)
+                # Pump window events even if vision has temporarily stopped,
+                # so q/z remain responsive while the RTDE chain is running.
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    self._display_quit_event.set()
+                elif key == ord('z'):
+                    self._force_zero_event.set()
+        except BaseException as exc:
+            with self._display_lock:
+                self._display_error = exc
+            self._display_quit_event.set()
+        finally:
+            try:
+                cv2.destroyWindow("SO-PBVS View")
+            except cv2.error:
+                pass
+
     def _reset_force_bias(self, manual: bool = False):
         self._force_bias = np.zeros(6)
         self._force_bias_ready = self.cfg.rtde_force_bias_samples <= 0
@@ -996,6 +1082,9 @@ class PBVSController:
                 "controller_mode": mode,
                 "accel_saturated": int(self._last_accel_saturated),
                 "control_hz": float(self._instant_control_hz),
+                "total_hz": float(self._instant_total_hz),
+                "vision_hz": float(self._instant_vision_hz),
+                "force_control_hz": float(self._instant_force_control_hz),
                 "vision_age_ms": float(self._last_vision_age * 1000.0),
                 "ekf_enabled": int(self.cfg.enable_pbvs_ekf),
                 "ekf_measurement_accepted": int(
@@ -1098,7 +1187,14 @@ class PBVSController:
         with self._vision_lock:
             self._latest_vision_sample = None
             self._vision_error = None
+        with self._display_lock:
+            self._latest_display_snapshot = None
+            self._display_error = None
         self._vision_stop_event.clear()
+        self._display_stop_event.clear()
+        self._display_update_event.clear()
+        self._display_quit_event.clear()
+        self._force_zero_event.clear()
         vision_thread = threading.Thread(
             target=self._vision_worker,
             args=(pipeline,),
@@ -1106,6 +1202,14 @@ class PBVSController:
             daemon=True,
         )
         vision_thread.start()
+        display_thread = None
+        if self.cfg.enable_visualization:
+            display_thread = threading.Thread(
+                target=self._display_worker,
+                name="OpenCVDisplay",
+                daemon=True,
+            )
+            display_thread.start()
 
         last_vision_sequence = -1
         latest_target_timestamp: Optional[float] = None
@@ -1115,10 +1219,32 @@ class PBVSController:
 
         try:
             while True:
+                loop_timestamp = time.perf_counter()
+                if self._last_loop_timestamp is not None:
+                    self._instant_total_hz = 1.0 / max(
+                        loop_timestamp - self._last_loop_timestamp, 1e-9
+                    )
+                self._last_loop_timestamp = loop_timestamp
+
                 now = time.time()
                 if self.cfg.max_runtime > 0 and (now - self._t0) > self.cfg.max_runtime:
                     print("\nMax runtime reached; stopping.")
                     break
+                with self._display_lock:
+                    display_error = self._display_error
+                if display_error is not None:
+                    raise RuntimeError("Display worker failed") from display_error
+                if self._display_quit_event.is_set():
+                    break
+                if self._force_zero_event.is_set():
+                    self._force_zero_event.clear()
+                    if self.cfg.enable_rtde_tcp_force:
+                        self._reset_force_bias(manual=True)
+                    else:
+                        print(
+                            "\nForce sensor zeroing unavailable: "
+                            "RTDE force input is disabled."
+                        )
 
                 t_start = self.rtde_c.initPeriod()
                 try:
@@ -1174,6 +1300,15 @@ class PBVSController:
                     if vision_sample["detection_updated"]:
                         if detection is not None and T_base_cam is not None:
                             measurement_timestamp = vision_sample["timestamp"]
+                            if self._last_visual_measurement_timestamp is not None:
+                                self._instant_vision_hz = 1.0 / max(
+                                    measurement_timestamp
+                                    - self._last_visual_measurement_timestamp,
+                                    1e-9,
+                                )
+                            self._last_visual_measurement_timestamp = (
+                                measurement_timestamp
+                            )
                             if self.cfg.enable_pbvs_ekf:
                                 measurement = self._pose_to_ekf_measurement(
                                     detection[0]
@@ -1258,6 +1393,20 @@ class PBVSController:
                             if self.cfg.enable_pbvs_ekf else None
                         ),
                     )
+                    if (
+                        controller_name in ("cA", "cB")
+                        and rtde_wrench_tcp is not None
+                    ):
+                        force_control_timestamp = time.perf_counter()
+                        if self._last_force_control_timestamp is not None:
+                            self._instant_force_control_hz = 1.0 / max(
+                                force_control_timestamp
+                                - self._last_force_control_timestamp,
+                                1e-9,
+                            )
+                        self._last_force_control_timestamp = (
+                            force_control_timestamp
+                        )
 
                 if v_cmd is not None:
                     self.rtde_c.speedL(v_cmd, move_acc, self.dt)
@@ -1302,6 +1451,10 @@ class PBVSController:
                     command_active = False
                     self._last_command_timestamp = None
                     self._instant_control_hz = float("nan")
+                    self._last_force_control_timestamp = None
+                    self._instant_force_control_hz = float("nan")
+                    if self._last_vision_age > self.cfg.vision_stale_timeout:
+                        self._instant_vision_hz = float("nan")
                     if self._frame_idx % self.cfg.status_print_interval == 0:
                         age_s = (
                             f"{self._last_vision_age * 1000.0:.0f}ms"
@@ -1323,22 +1476,12 @@ class PBVSController:
                         display_corners = display_R = display_t = None
                     else:
                         _, display_corners, display_R, display_t = display_detection
-                    self._visualize(
-                        vision_sample["image"],
+                    self._publish_display_snapshot(
+                        vision_sample,
                         display_corners,
-                        v_cmd,
                         display_R,
                         display_t,
                     )
-
-                key = cv2.waitKey(1) & 0xFF if self.cfg.enable_visualization else 0
-                if key == ord('q'):
-                    break
-                if key == ord('z'):
-                    if self.cfg.enable_rtde_tcp_force:
-                        self._reset_force_bias(manual=True)
-                    else:
-                        print("\nForce sensor zeroing unavailable: RTDE force input is disabled.")
 
                 self.rtde_c.waitPeriod(t_start)
 
@@ -1347,15 +1490,33 @@ class PBVSController:
         finally:
             self.rtde_c.speedStop()
             self._vision_stop_event.set()
+            self._display_stop_event.set()
+            self._display_update_event.set()
             vision_thread.join(timeout=1.0)
+            if display_thread is not None:
+                display_thread.join(timeout=1.0)
             self.rtde_c.stopScript()
             print("\nControl stopped.")
             self.save_log_csv()
 
-    def _visualize(self, img, corners, v_cmd, R_cur, t_cur):
+    def _visualize(self, snapshot):
+        img = snapshot["image"]
+        corners = snapshot["corners"]
+        R_cur = snapshot["R_cur"]
+        t_cur = snapshot["t_cur"]
         vis = img.copy()
-        K = self.estimator.K
-        controller_name = self.cfg.controller_name
+        K = snapshot["K"]
+        controller_name = snapshot["controller_name"]
+        target_name = snapshot["target_name"]
+        desired_T = snapshot["desired_T"]
+        tag_size = snapshot["tag_size"]
+        s_p = snapshot["s_p"]
+        wrench_cam = snapshot["wrench_cam"]
+        enable_force = snapshot["enable_force"]
+        force_bias_ready = snapshot["force_bias_ready"]
+        force_bias_count = snapshot["force_bias_count"]
+        force_bias_samples = snapshot["force_bias_samples"]
+        gravity_enabled = snapshot["gravity_enabled"]
         h_img, w_img = vis.shape[:2]
         image_labels = []
 
@@ -1378,11 +1539,11 @@ class PBVSController:
                     ori, (10, 18), 0.35, (0, 255, 0),
                 ))
 
-            force_cam = np.asarray(self._last_wrench_cam[:3], dtype=float)
+            force_cam = np.asarray(wrench_cam[:3], dtype=float)
             force_norm = float(np.linalg.norm(force_cam))
             force_valid = (
-                self.cfg.enable_rtde_tcp_force
-                and self._force_bias_ready
+                enable_force
+                and force_bias_ready
                 and np.all(np.isfinite(force_cam))
             )
             if force_valid and force_norm > 1e-9:
@@ -1426,10 +1587,10 @@ class PBVSController:
                         arrow_2d[1], (7, -7), 0.45, force_color,
                     ))
 
-        if self.cur_target is not None:
-            Td = self._desired_T()
+        if target_name:
+            Td = desired_T
             Rd, td = Td[:3, :3], Td[:3, 3]
-            c3d = get_tag_3d_corners(self.cfg.tag_size, Td)
+            c3d = get_tag_3d_corners(tag_size, Td)
             if np.all(c3d[:, 2] > 0):
                 c2d = project_3d_to_2d(c3d, K)
                 in_v = np.all((c2d[:, 0] >= -50) & (c2d[:, 0] < w_img+50) &
@@ -1444,12 +1605,12 @@ class PBVSController:
                     )
                     draw_axis(vis, K, Rd, td, length=0.03)
 
-        if np.all(np.isfinite(self._last_s_p)):
-            p_p, q_p = self._feature_to_pose_parts(self._last_s_p)
+        if np.all(np.isfinite(s_p)):
+            p_p, q_p = self._feature_to_pose_parts(s_p)
             T_p = np.eye(4)
             T_p[:3, :3] = matrix_from_quat(q_p)
             T_p[:3, 3] = p_p
-            proxy_corners_3d = get_tag_3d_corners(self.cfg.tag_size, T_p)
+            proxy_corners_3d = get_tag_3d_corners(tag_size, T_p)
             if np.all(proxy_corners_3d[:, 2] > 0):
                 proxy_corners_2d = project_3d_to_2d(proxy_corners_3d, K)
                 in_view = np.all(
@@ -1476,29 +1637,29 @@ class PBVSController:
                     )
 
         hud_y = 45
-        sat = self._last_accel_saturated
+        sat = snapshot["accel_saturated"]
 
-        if not self.cfg.enable_rtde_tcp_force:
+        if not enable_force:
             force_status = "Force-Zero: disabled"
             force_color = (140, 140, 140)
-        elif self._force_bias_ready:
+        elif force_bias_ready:
             gravity_status = (
                 "Gravity: ON"
-                if self._static_gravity_compensator is not None
+                if gravity_enabled
                 else "Gravity: OFF"
             )
             force_status = f"Force-Zero: READY [z]  {gravity_status}"
             force_color = (0, 200, 80)
         else:
             force_status = (
-                f"Force-Zero: {self._force_bias_count}/"
-                f"{self.cfg.rtde_force_bias_samples}"
+                f"Force-Zero: {force_bias_count}/"
+                f"{force_bias_samples}"
             )
             force_color = (0, 180, 255)
-        force_cam = np.asarray(self._last_wrench_cam[:3], dtype=float)
+        force_cam = np.asarray(wrench_cam[:3], dtype=float)
         force_valid = (
-            self.cfg.enable_rtde_tcp_force
-            and self._force_bias_ready
+            enable_force
+            and force_bias_ready
             and np.all(np.isfinite(force_cam))
         )
         if force_valid:
@@ -1513,6 +1674,22 @@ class PBVSController:
             force_text = "|F_cam|: unavailable"
             components_text = "Fx:--  Fy:--  Fz:--"
             measurement_color = (140, 140, 140)
+        total_hz_text = (
+            f"{snapshot['total_hz']:.1f}"
+            if np.isfinite(snapshot["total_hz"]) else "--.-"
+        )
+        vision_hz_text = (
+            f"{snapshot['vision_hz']:.1f}"
+            if np.isfinite(snapshot["vision_hz"]) else "--.-"
+        )
+        force_hz_text = (
+            f"{snapshot['force_control_hz']:.1f}"
+            if np.isfinite(snapshot["force_control_hz"]) else "--.-"
+        )
+        frequency_text = (
+            f"Hz  Total:{total_hz_text}  Vision:{vision_hz_text}  "
+            f"Force:{force_hz_text}"
+        )
         display = cv2.rotate(vis, cv2.ROTATE_180)
 
         for text, anchor, offset, scale, color in image_labels:
@@ -1526,7 +1703,7 @@ class PBVSController:
                         color, 1, cv2.LINE_AA)
 
         cv2.putText(display,
-                    f"[{controller_name}] {self.cur_target.name if self.cur_target else ''}",
+                    f"[{controller_name}] {target_name}",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                     (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(display, f"Accel-SAT: {'YES' if sat else 'no '}",
@@ -1541,6 +1718,9 @@ class PBVSController:
         cv2.putText(display, components_text, (10, hud_y + 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                     measurement_color, 1, cv2.LINE_AA)
+        cv2.putText(display, frequency_text, (10, hud_y + 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (255, 255, 255), 1, cv2.LINE_AA)
         cv2.imshow("SO-PBVS View", display)
 
     def _dashed_line(self, img, pt1, pt2, color, thickness, dash_len):

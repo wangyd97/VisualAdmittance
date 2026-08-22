@@ -42,9 +42,9 @@ def controller_params() -> dict:
         feature_admittance_damping= 20.0,
         feature_admittance_stiffness= 500.0,
         feature_admittance_max_offset=(float("inf"),) * 6,
-        cartesian_admittance_mass=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
-        cartesian_admittance_damping=(20.0, 20.0, 20.0, 20.0, 20.0, 20.0),
-        cartesian_admittance_stiffness=(500.0, 500.0, 500.0, 500.0, 500.0, 500.0),
+        cartesian_admittance_mass=(1.0, 1.0, 1.0, 0.1, 0.1, 0.1),
+        cartesian_admittance_damping=(20.0, 20.0, 20.0, 2.0, 2.0, 2.0),
+        cartesian_admittance_stiffness=(500.0, 500.0, 500.0, 10.0, 10.0, 10.0),
         cartesian_admittance_max_offset=(float("inf"),) * 6,
     )
 
@@ -54,9 +54,9 @@ def build_config(args) -> PBVSConfig:
     data_dir = project_dir / "data"
     gravity_model_path = Path(args.gravity_model)
     gravity_compensation_enabled = (
-        not args.no_gravity_compensation and gravity_model_path.is_file()
+        not args.no_gravity and gravity_model_path.is_file()
     )
-    if not args.no_gravity_compensation and not gravity_compensation_enabled:
+    if not args.no_gravity and not gravity_compensation_enabled:
         print(
             f"Static gravity model not found: {gravity_model_path}. "
             "Running with the legacy single-pose force zero."
@@ -97,7 +97,7 @@ def build_config(args) -> PBVSConfig:
         log_save_path=str(data_dir / f"log_{controller_name}.csv"),
         enable_memory_log=ENABLE_MEMORY_LOG,
         status_print_interval=STATUS_PRINT_INTERVAL,
-        enable_pbvs_ekf=not args.no_pbvs_ekf,
+        enable_pbvs_ekf=args.ekf,
         enable_static_gravity_compensation=gravity_compensation_enabled,
         static_gravity_model_path=str(gravity_model_path),
         controller_name=controller_name,
@@ -149,14 +149,14 @@ def main():
         help="Offline-identified static wrench compensation model.",
     )
     parser.add_argument(
-        "--no-gravity-compensation",
+        "--no-gravity",
         action="store_true",
         help="Disable the static gravity model even if the model file exists.",
     )
     parser.add_argument(
-        "--no-pbvs-ekf",
+        "--ekf",
         action="store_true",
-        help="Disable high-rate PBVS EKF prediction and target-motion compensation.",
+        help="Enable high-rate PBVS EKF prediction and target-motion compensation.",
     )
     args = parser.parse_args()
 
@@ -179,7 +179,7 @@ def main():
     controller.set_targets(build_targets())
 
     init_pose = np.array([
-        -0.25588217, -0.15717437,  0.250001008,
+        -0.25588217, -0.15717437,  0.350001008,
         3.10924706, -0.43501290,  0.01221673,
     ])
     # init_pose = np.array([
