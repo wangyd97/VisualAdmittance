@@ -26,10 +26,10 @@ available so that controller results can be plotted with the same tools. -->
 The runtime is split into three independent execution chains:
 
 1. `AprilTagVision` owns RealSense capture and AprilTag detection at the camera
-   rate.
+   rate (60Hz).
 2. The RTDE chain reads robot pose, speed, and wrench; applies gravity
    compensation, force filtering, EKF prediction, admittance, and PBVS; then
-   sends `speedL` commands at 200 Hz.
+   sends `speedL` commands at 1000 Hz.
 3. `OpenCVDisplay` renders the overlay and owns `imshow`/`waitKey` without
    running GUI work in the RTDE chain.
 
