@@ -12,12 +12,14 @@ from rtde_receive import RTDEReceiveInterface as RTDEReceive # pyright: ignore[r
 from .config import PBVSConfig, TargetPose
 from .geometry import (
     compute_L,
+    compute_N,
     compute_b,
     get_tag_3d_corners,
     inv_T,
     project_3d_to_2d,
 )
 from .gravity_compensation import StaticGravityCompensator
+from .pbvs_ekf import PBVSTargetMotionEKF
 from .Mathematic import (
     euler_xyz_from_matrix,
     matrix_from_quat,
@@ -232,7 +234,7 @@ class PBVSController:
         self.dt = 1.0 / self.rtde_freq
 
         self.rtde_c = RTDEControl(robot_ip, self.rtde_freq)
-        receive_vars = ["actual_TCP_pose", "actual_TCP_force"]
+        receive_vars = ["actual_TCP_pose", "actual_TCP_speed", "actual_TCP_force"]
         self.rtde_r = RTDEReceive(
             robot_ip, self.rtde_freq,
             receive_vars,
@@ -253,6 +255,7 @@ class PBVSController:
 
         self._feature_admittance = FeatureSpaceAdmittance(self.cfg, self.dt)
         self._cartesian_admittance = CartesianSpaceAdmittance(self.cfg, self.dt)
+        self._pbvs_ekf = PBVSTargetMotionEKF(self.cfg)
         self._error_log: list = []
         self._t0: float = 0.0
         self._frame_idx = 0
@@ -267,6 +270,10 @@ class PBVSController:
         self._last_s_dot = np.zeros(6)
         self._last_s_p_dot = np.zeros(6)
         self._last_s_p_ddot = np.zeros(6)
+        self._last_visual_measurement = np.full(6, float("nan"))
+        self._last_object_twist = np.zeros(6)
+        self._last_object_acceleration = np.zeros(6)
+        self._last_ekf_measurement_accepted = False
         self._last_cartesian_proxy_quat: Optional[np.ndarray] = None
         self._force_bias = np.zeros(6)
         self._static_gravity_compensator: Optional[StaticGravityCompensator] = None
@@ -312,6 +319,7 @@ class PBVSController:
         self._u_c_integrated = np.zeros(6)
         self._feature_admittance.reset()
         self._cartesian_admittance.reset()
+        self._pbvs_ekf.reset()
         self._last_u_c = np.zeros(6)
         self._last_R_base_cam = None
         self._last_detection = None
@@ -322,6 +330,10 @@ class PBVSController:
         self._last_s_dot = np.zeros(6)
         self._last_s_p_dot = np.zeros(6)
         self._last_s_p_ddot = np.zeros(6)
+        self._last_visual_measurement = np.full(6, float("nan"))
+        self._last_object_twist = np.zeros(6)
+        self._last_object_acceleration = np.zeros(6)
+        self._last_ekf_measurement_accepted = False
         self._last_cartesian_proxy_quat = None
         self._force_lowpass = np.zeros(6)
         self._last_wrench_tcp_raw = np.full(6, float("nan"))
@@ -368,6 +380,22 @@ class PBVSController:
         s = np.concatenate([c_p_oc, c_q_oc[1:4]])
         return s, s_d
 
+    def _pose_to_ekf_measurement(self, T_current: np.ndarray) -> np.ndarray:
+        """Convert c_T_o to the six PBVS states used by the EKF."""
+        quaternion = quat_from_matrix(T_current[:3, :3])
+        # The project reconstructs qw as the positive square root from qv.
+        # Keep measurements on that same quaternion hemisphere.
+        if quaternion[0] < 0.0:
+            quaternion = -quaternion
+        return np.concatenate([T_current[:3, 3], quaternion[1:4]])
+
+    def _ekf_feature_to_pose(self, feature: np.ndarray) -> np.ndarray:
+        position, quaternion = self._feature_to_pose_parts(feature)
+        transform = np.eye(4)
+        transform[:3, :3] = matrix_from_quat(quaternion)
+        transform[:3, 3] = position
+        return transform
+
     def _filter_feature_s(self, s: np.ndarray) -> np.ndarray:
         s = np.asarray(s, dtype=float).reshape(6)
         if not self.cfg.enable_feature_lowpass or self.cfg.feature_lowpass_tau <= 0.0:
@@ -397,13 +425,27 @@ class PBVSController:
         q0 = np.sqrt(max(0.0, 1.0 - qv_norm_sq))
         return c_p_oc, np.array([q0, qv[0], qv[1], qv[2]], dtype=float)
 
-    def _compute_u_dot_c(self, alpha_c: np.ndarray, c_q_oc: np.ndarray,
-                  c_p_oc: np.ndarray, L_inv: np.ndarray,
-                  u_c: np.ndarray, R_base_cam: np.ndarray) -> np.ndarray:
-        """Camera acceleration for the stationary-object PBVS model."""
-        u_o = np.zeros(6)
-        b = compute_b(c_p_oc, c_q_oc, u_c, u_o, R_base_cam)
-        return L_inv @ (alpha_c - b)
+    def _compute_u_dot_c(
+            self,
+            alpha_c: np.ndarray,
+            c_q_oc: np.ndarray,
+            c_p_oc: np.ndarray,
+            L_inv: np.ndarray,
+            u_c: np.ndarray,
+            R_base_cam: np.ndarray,
+            object_twist: np.ndarray,
+            object_acceleration: np.ndarray) -> np.ndarray:
+        """Camera acceleration including estimated target-motion feedforward."""
+        object_twist = np.asarray(object_twist, dtype=float).reshape(6)
+        object_acceleration = np.asarray(
+            object_acceleration, dtype=float
+        ).reshape(6)
+        N = compute_N(c_q_oc, R_base_cam)
+        b = compute_b(
+            c_p_oc, c_q_oc, u_c, object_twist, R_base_cam
+        )
+        # s_ddot = L*u_dot_c + N*u_o_dot + b.
+        return L_inv @ (alpha_c - N @ object_acceleration - b)
 
     def _clip_direct_camera_acceleration(self, u_dot_c: np.ndarray) -> tuple[np.ndarray, bool]:
         limits = np.asarray(self.cfg.accel_limit, dtype=float).reshape(6)
@@ -490,9 +532,25 @@ class PBVSController:
                          R_base_cam: np.ndarray,
                          T_base_cam: Optional[np.ndarray] = None,
                          external_wrench_cam: np.ndarray = None,
-                         feature_force: np.ndarray = None):
+                         feature_force: np.ndarray = None,
+                         object_twist: np.ndarray = None,
+                         object_acceleration: np.ndarray = None,
+                         measured_camera_twist: np.ndarray = None):
         s, s_d = self._compute_features(T_current)
-        s = self._filter_feature_s(s)
+        if self.cfg.enable_pbvs_ekf:
+            # The EKF already filters the measurement and predicts it at the
+            # RTDE rate; another low-pass would add avoidable phase lag.
+            self._s_lowpass = s.copy()
+        else:
+            s = self._filter_feature_s(s)
+        if object_twist is None:
+            object_twist = np.zeros(6)
+        if object_acceleration is None:
+            object_acceleration = np.zeros(6)
+        object_twist = np.asarray(object_twist, dtype=float).reshape(6)
+        object_acceleration = np.asarray(
+            object_acceleration, dtype=float
+        ).reshape(6)
         c_p_oc, c_q_oc = self._feature_to_pose_parts(s)
         L = compute_L(c_p_oc, c_q_oc, R_base_cam)
         try:
@@ -522,21 +580,37 @@ class PBVSController:
             self._last_s_p_ddot = self._feature_admittance.s_p_ddot.copy()
         e = s_p - s
         u_c = self._last_u_c.copy()
+        u_c_feedback = u_c.copy()
+        if measured_camera_twist is not None:
+            u_c_feedback = np.asarray(
+                measured_camera_twist, dtype=float
+            ).reshape(6)
         
-        s_dot_by_interaction_matrix = L @ u_c
+        s_dot_by_interaction_matrix = L @ u_c_feedback
+        N = compute_N(c_q_oc, R_base_cam)
+        estimated_s_dot = s_dot_by_interaction_matrix + N @ object_twist
         K = np.diag(self.cfg.kp)
         B = np.diag(self.cfg.kd)
-        edot = s_p_dot - s_dot_by_interaction_matrix
+        edot = s_p_dot - estimated_s_dot
         self._last_s = s.copy()
         self._last_s_p = s_p.copy()
         self._last_s_d = s_d.copy()
-        self._last_s_dot = s_dot_by_interaction_matrix.copy()
+        self._last_s_dot = estimated_s_dot.copy()
+        self._last_object_twist = object_twist.copy()
+        self._last_object_acceleration = object_acceleration.copy()
         mode = self.cfg.controller_mode.upper()
 
         if mode == "SOPD":
             alpha_c = K @ e + B @ edot
             u_dot_c = self._compute_u_dot_c(
-                alpha_c, c_q_oc, c_p_oc, L_inv, u_c, R_base_cam
+                alpha_c,
+                c_q_oc,
+                c_p_oc,
+                L_inv,
+                u_c_feedback,
+                R_base_cam,
+                object_twist,
+                object_acceleration,
             )
             u_dot_c, self._last_accel_saturated = self._clip_direct_camera_acceleration(u_dot_c)
 
@@ -568,6 +642,17 @@ class PBVSController:
         v_tcp_base = v_c_base + np.cross(omega_base, b_p_ec)
 
         return np.concatenate([v_tcp_base, omega_base])
+
+    def _tcp_to_camera_twist_base(
+            self, tcp_twist: np.ndarray, tcp_pose: np.ndarray) -> np.ndarray:
+        """Convert the measured base-frame TCP twist to the camera origin."""
+        tcp_twist = np.asarray(tcp_twist, dtype=float).reshape(6)
+        tcp_pose = np.asarray(tcp_pose, dtype=float).reshape(6)
+        R_base_tcp = matrix_from_rotvec(tcp_pose[3:])
+        b_p_ec = R_base_tcp @ self.e_p_ec
+        omega_base = tcp_twist[3:]
+        v_camera_base = tcp_twist[:3] - np.cross(omega_base, b_p_ec)
+        return np.concatenate([v_camera_base, omega_base])
 
     def _control_tcp_pose(self, actual_pose: Optional[np.ndarray]) -> Optional[np.ndarray]:
         if not self.cfg.use_commanded_tcp_pose_estimate:
@@ -640,6 +725,7 @@ class PBVSController:
 
                 # Own the image memory after the RealSense frame is released.
                 image = np.asanyarray(color_frame.get_data()).copy()
+                capture_timestamp = time.perf_counter()
                 gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
                 should_detect = (
                     cached_detection is None
@@ -654,7 +740,8 @@ class PBVSController:
 
                 sample = {
                     "sequence": frame_index,
-                    "timestamp": time.perf_counter(),
+                    "timestamp": capture_timestamp,
+                    "processed_timestamp": time.perf_counter(),
                     "image": image,
                     "detection": cached_detection,
                     "detection_updated": detection_updated,
@@ -802,6 +889,9 @@ class PBVSController:
                      external_wrench_cam: np.ndarray = None,
                      rtde_wrench_tcp: np.ndarray = None,
                      feature_force: np.ndarray = None,
+                     object_twist: np.ndarray = None,
+                     object_acceleration: np.ndarray = None,
+                     measured_camera_twist: np.ndarray = None,
                      detection=None,
                      T_base_cam: np.ndarray = None,
                      R_base_cam: np.ndarray = None):
@@ -841,6 +931,9 @@ class PBVSController:
             T_base_cam=T_base_cam,
             external_wrench_cam=external_wrench_cam,
             feature_force=feature_force,
+            object_twist=object_twist,
+            object_acceleration=object_acceleration,
+            measured_camera_twist=measured_camera_twist,
         )
         self._last_u_c = u_c.copy()
 
@@ -904,6 +997,17 @@ class PBVSController:
                 "accel_saturated": int(self._last_accel_saturated),
                 "control_hz": float(self._instant_control_hz),
                 "vision_age_ms": float(self._last_vision_age * 1000.0),
+                "ekf_enabled": int(self.cfg.enable_pbvs_ekf),
+                "ekf_measurement_accepted": int(
+                    self._last_ekf_measurement_accepted
+                ),
+                "ekf_innovation_norm": float(
+                    self._pbvs_ekf.last_innovation_norm
+                ),
+                "ekf_nis": float(self._pbvs_ekf.last_nis),
+                "ekf_motion_compensation_scale": float(
+                    self._pbvs_ekf.motion_compensation_scale
+                ),
                 "tcp_x": float(logged_pose[0]),
                 "tcp_y": float(logged_pose[1]),
                 "tcp_z": float(logged_pose[2]),
@@ -925,6 +1029,19 @@ class PBVSController:
                 row[f"spdot{i}"] = float(self._last_s_p_dot[i])
                 row[f"spddot{i}"] = float(self._last_s_p_ddot[i])
                 row[f"sdot{i}"] = float(self._last_s_dot[i])
+                row[f"vision_s{i}"] = float(self._last_visual_measurement[i])
+                row[f"object_twist{i}"] = float(
+                    self._last_object_twist[i]
+                )
+                row[f"object_acceleration{i}"] = float(
+                    self._last_object_acceleration[i]
+                )
+                row[f"ekf_object_twist_raw{i}"] = float(
+                    self._pbvs_ekf.object_twist[i]
+                )
+                row[f"ekf_object_acceleration_raw{i}"] = float(
+                    self._pbvs_ekf.object_acceleration[i]
+                )
                 row[f"uc{i}"] = float(u_c[i])
                 row[f"udotc{i}"] = float(u_dot_c[i])
                 row[f"tcp_force_raw{i}"] = float(self._last_wrench_tcp_raw[i])
@@ -963,7 +1080,7 @@ class PBVSController:
             writer.writerows(self._error_log)
         print(f"Log saved: {log_path}")
 
-    def run(self, pipeline, init_pose, move_acc: float = 8.0):
+    def run(self, pipeline, init_pose, move_acc: float = 10.0):
         if not self.targets:
             print("Nothing detected!")
             return
@@ -1008,12 +1125,34 @@ class PBVSController:
                     tcp_pose_now = np.array(self.rtde_r.getActualTCPPose())
                 except Exception:
                     tcp_pose_now = None
+                try:
+                    tcp_speed_now = np.array(self.rtde_r.getActualTCPSpeed())
+                except Exception:
+                    tcp_speed_now = None
                 tcp_pose_ctrl = self._control_tcp_pose(tcp_pose_now)
 
                 T_base_cam = None
                 R_base_cam = None
                 if tcp_pose_ctrl is not None:
                     T_base_cam, R_base_cam = self._base_camera_pose(tcp_pose_ctrl)
+
+                camera_twist_actual = self._last_u_c.copy()
+                if tcp_pose_now is not None and tcp_speed_now is not None:
+                    camera_twist_actual = self._tcp_to_camera_twist_base(
+                        tcp_speed_now, tcp_pose_now
+                    )
+
+                control_timestamp = time.perf_counter()
+                if (
+                    self.cfg.enable_pbvs_ekf
+                    and self._pbvs_ekf.initialized
+                    and R_base_cam is not None
+                ):
+                    self._pbvs_ekf.predict(
+                        camera_twist_actual,
+                        R_base_cam,
+                        control_timestamp,
+                    )
 
                 wrench_raw = self._read_rtde_tcp_force()
                 rtde_wrench_tcp = self._update_force_bias_and_filter(
@@ -1028,37 +1167,77 @@ class PBVSController:
                     vision_sample is not None
                     and vision_sample["sequence"] != last_vision_sequence
                 )
+                self._last_ekf_measurement_accepted = False
                 if new_vision_sample:
                     last_vision_sequence = vision_sample["sequence"]
                     detection = vision_sample["detection"]
                     if vision_sample["detection_updated"]:
                         if detection is not None and T_base_cam is not None:
-                            latest_T_base_object = T_base_cam @ detection[0]
-                            latest_target_timestamp = vision_sample["timestamp"]
-                            latest_corners = detection[1].copy()
-                        else:
-                            latest_T_base_object = None
-                            latest_target_timestamp = None
-                            latest_corners = None
+                            measurement_timestamp = vision_sample["timestamp"]
+                            if self.cfg.enable_pbvs_ekf:
+                                measurement = self._pose_to_ekf_measurement(
+                                    detection[0]
+                                )
+                                self._last_visual_measurement = measurement.copy()
+                                accepted = self._pbvs_ekf.update(
+                                    measurement, measurement_timestamp
+                                )
+                                self._last_ekf_measurement_accepted = accepted
+                                if accepted:
+                                    # A first measurement initializes the EKF
+                                    # at capture time. Bring it to this RTDE
+                                    # cycle immediately.
+                                    self._pbvs_ekf.predict(
+                                        camera_twist_actual,
+                                        R_base_cam,
+                                        control_timestamp,
+                                    )
+                                    latest_target_timestamp = measurement_timestamp
+                                    latest_corners = detection[1].copy()
+                            else:
+                                latest_T_base_object = T_base_cam @ detection[0]
+                                latest_target_timestamp = measurement_timestamp
+                                latest_corners = detection[1].copy()
 
-                control_timestamp = time.perf_counter()
                 if latest_target_timestamp is None:
                     self._last_vision_age = float("inf")
                 else:
                     self._last_vision_age = max(
                         0.0, control_timestamp - latest_target_timestamp
                     )
-                vision_fresh = (
-                    latest_T_base_object is not None
-                    and T_base_cam is not None
-                    and self._last_vision_age <= self.cfg.vision_stale_timeout
-                )
+                if self.cfg.enable_pbvs_ekf:
+                    vision_fresh = (
+                        self._pbvs_ekf.initialized
+                        and T_base_cam is not None
+                        and self._last_vision_age <= self.cfg.vision_stale_timeout
+                    )
+                else:
+                    vision_fresh = (
+                        latest_T_base_object is not None
+                        and T_base_cam is not None
+                        and self._last_vision_age <= self.cfg.vision_stale_timeout
+                    )
 
                 v_cmd = None
                 errs = None
                 converged = False
                 if vision_fresh:
-                    T_current = inv_T(T_base_cam) @ latest_T_base_object
+                    if self.cfg.enable_pbvs_ekf:
+                        T_current = self._ekf_feature_to_pose(
+                            self._pbvs_ekf.feature
+                        )
+                        object_twist = (
+                            self._pbvs_ekf.object_twist
+                            * self._pbvs_ekf.motion_compensation_scale
+                        )
+                        object_acceleration = (
+                            self._pbvs_ekf.object_acceleration
+                            * self._pbvs_ekf.motion_compensation_scale
+                        )
+                    else:
+                        T_current = inv_T(T_base_cam) @ latest_T_base_object
+                        object_twist = np.zeros(6)
+                        object_acceleration = np.zeros(6)
                     detection_for_control = (
                         T_current,
                         latest_corners,
@@ -1072,6 +1251,12 @@ class PBVSController:
                         detection=detection_for_control,
                         T_base_cam=T_base_cam,
                         R_base_cam=R_base_cam,
+                        object_twist=object_twist,
+                        object_acceleration=object_acceleration,
+                        measured_camera_twist=(
+                            camera_twist_actual
+                            if self.cfg.enable_pbvs_ekf else None
+                        ),
                     )
 
                 if v_cmd is not None:
@@ -1106,6 +1291,14 @@ class PBVSController:
                         self.rtde_c.speedStop()
                         self._u_c_integrated[:] = 0.0
                         self._last_u_c[:] = 0.0
+                    if (
+                        self.cfg.enable_pbvs_ekf
+                        and self._pbvs_ekf.initialized
+                        and self._last_vision_age > self.cfg.vision_stale_timeout
+                    ):
+                        self._pbvs_ekf.reset()
+                        self._last_object_twist[:] = 0.0
+                        self._last_object_acceleration[:] = 0.0
                     command_active = False
                     self._last_command_timestamp = None
                     self._instant_control_hz = float("nan")

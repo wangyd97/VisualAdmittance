@@ -18,6 +18,39 @@ class PBVSConfig:
     # within this many seconds.
     vision_stale_timeout: float = 0.10
 
+    # PBVS EKF state for this project's kinematics: [s, u_o, u_o_dot], where
+    # s_dot = L(s) u_c + N(s) u_o. Predictions run at the RTDE rate and
+    # AprilTag poses provide delayed measurement updates.
+    enable_pbvs_ekf: bool = False
+    pbvs_ekf_measurement_std: object = (0.002, 0.002, 0.002, 0.005, 0.005, 0.005)
+    pbvs_ekf_process_std_feature: object = (0.002, 0.002, 0.002, 0.01, 0.01, 0.01)
+    pbvs_ekf_process_std_object_twist: object = (
+        0.02, 0.02, 0.02, 0.10, 0.10, 0.10
+    )
+    pbvs_ekf_process_std_object_acceleration: object = (
+        0.50, 0.50, 0.50, 1.00, 1.00, 1.00
+    )
+    pbvs_ekf_initial_object_twist_std: object = (
+        0.10, 0.10, 0.10, 0.25, 0.25, 0.25
+    )
+    pbvs_ekf_initial_object_acceleration_std: object = (
+        1.00, 1.00, 1.00, 2.00, 2.00, 2.00
+    )
+    pbvs_ekf_max_object_twist: object = (
+        1.00, 1.00, 1.00, 2.00, 2.00, 2.00
+    )
+    pbvs_ekf_max_object_acceleration: object = (
+        5.00, 5.00, 5.00, 10.0, 10.0, 10.0
+    )
+    pbvs_ekf_jacobian_epsilon: object = (
+        1e-5, 1e-5, 1e-5, 1e-5, 1e-5, 1e-5
+    )
+    pbvs_ekf_innovation_gate: float = 100.0
+    pbvs_ekf_history_duration: float = 0.25
+    pbvs_ekf_max_prediction_step: float = 0.02
+    pbvs_ekf_motion_compensation_warmup_updates: int = 5
+    pbvs_ekf_motion_compensation_ramp_updates: int = 10
+
     pos_threshold: float = 0.005
     rot_threshold: float = 0.02
     stable_frames: int = 10
@@ -91,6 +124,34 @@ class PBVSConfig:
         self.apriltag_quad_sigma = max(0.0, float(self.apriltag_quad_sigma))
         self.visualization_stride = max(1, int(self.visualization_stride))
         self.vision_stale_timeout = max(0.0, float(self.vision_stale_timeout))
+        self.enable_pbvs_ekf = bool(self.enable_pbvs_ekf)
+        for name in (
+            "pbvs_ekf_measurement_std",
+            "pbvs_ekf_process_std_feature",
+            "pbvs_ekf_process_std_object_twist",
+            "pbvs_ekf_process_std_object_acceleration",
+            "pbvs_ekf_initial_object_twist_std",
+            "pbvs_ekf_initial_object_acceleration_std",
+            "pbvs_ekf_max_object_twist",
+            "pbvs_ekf_max_object_acceleration",
+            "pbvs_ekf_jacobian_epsilon",
+        ):
+            setattr(self, name, np.maximum(to_vec6(getattr(self, name), name), 1e-12))
+        self.pbvs_ekf_innovation_gate = max(
+            0.0, float(self.pbvs_ekf_innovation_gate)
+        )
+        self.pbvs_ekf_history_duration = max(
+            0.0, float(self.pbvs_ekf_history_duration)
+        )
+        self.pbvs_ekf_max_prediction_step = max(
+            1e-6, float(self.pbvs_ekf_max_prediction_step)
+        )
+        self.pbvs_ekf_motion_compensation_warmup_updates = max(
+            0, int(self.pbvs_ekf_motion_compensation_warmup_updates)
+        )
+        self.pbvs_ekf_motion_compensation_ramp_updates = max(
+            1, int(self.pbvs_ekf_motion_compensation_ramp_updates)
+        )
         self.slow_after_convergence = bool(self.slow_after_convergence)
         self.convergence_slowdown_frames = max(0, int(self.convergence_slowdown_frames))
         self.convergence_velocity_scale = float(np.clip(self.convergence_velocity_scale, 0.0, 1.0))

@@ -34,8 +34,8 @@ def hand_eye_matrix() -> np.ndarray:
 def controller_params() -> dict:
     return dict(
         controller_mode="SOPD",
-        kp=500 * np.ones(6),
-        kd=150 * np.ones(6),
+        kp=150 * np.ones(6),
+        kd=30 * np.ones(6),
         max_linear_vel=float("inf"),
         max_angular_vel=float("inf"),
         feature_admittance_mass= 1.0,
@@ -97,6 +97,7 @@ def build_config(args) -> PBVSConfig:
         log_save_path=str(data_dir / f"log_{controller_name}.csv"),
         enable_memory_log=ENABLE_MEMORY_LOG,
         status_print_interval=STATUS_PRINT_INTERVAL,
+        enable_pbvs_ekf=not args.no_pbvs_ekf,
         enable_static_gravity_compensation=gravity_compensation_enabled,
         static_gravity_model_path=str(gravity_model_path),
         controller_name=controller_name,
@@ -151,6 +152,11 @@ def main():
         "--no-gravity-compensation",
         action="store_true",
         help="Disable the static gravity model even if the model file exists.",
+    )
+    parser.add_argument(
+        "--no-pbvs-ekf",
+        action="store_true",
+        help="Disable high-rate PBVS EKF prediction and target-motion compensation.",
     )
     args = parser.parse_args()
 

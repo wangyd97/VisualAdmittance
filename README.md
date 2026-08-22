@@ -30,6 +30,38 @@ RTDE loop reconstructs the camera-to-object pose from the latest base-frame
 object estimate and the current robot pose.  Commands stop when the last
 successful tag estimate is older than `vision_stale_timeout`.
 
+## High-rate PBVS EKF and moving targets
+
+The controller enables an 18-state PBVS EKF by default, following the process
+model in Oliva et al., ICRA 2022:
+
+```text
+x = [s, object twist u_o, object acceleration u_o_dot]
+s_dot = L(s) * u_c + N(s) * u_o
+u_o_dot = object acceleration
+object acceleration_dot = 0
+```
+
+Actual TCP speed drives prediction at the 200 Hz RTDE rate. AprilTag poses at
+the camera rate update the first six states. Frame capture and processing
+timestamps are kept separate; delayed measurements update a buffered EKF state
+and the stored 200 Hz predictions are replayed to the present. The resulting
+high-rate feature estimate is used as `s`. Estimated object twist `u_o` is used
+in the error derivative through `N*u_o`, and `N*u_o_dot` is compensated in the
+SOPD acceleration command. Motion compensation is smoothly enabled after the first accepted
+measurements to avoid a startup acceleration transient. The old
+stationary-target reconstruction remains available with:
+
+```powershell
+python e2\main.py --controller cB --no-pbvs-ekf
+```
+
+Logs include `vision_s0..5`, `object_twist0..5`,
+`object_acceleration0..5`, the corresponding unscaled
+`ekf_object_*_raw0..5`,
+`ekf_motion_compensation_scale`, `ekf_innovation_norm`, and `ekf_nis` for
+tuning and comparison.
+
 ## Static gravity compensation
 
 The single-pose `z` zero cannot compensate an orientation-dependent payload
