@@ -61,10 +61,10 @@ u_o_dot = object acceleration
 object acceleration_dot = 0
 ```
 
-Actual TCP speed drives prediction at the 200 Hz RTDE rate. AprilTag poses at
+Actual TCP speed drives prediction at the 1000 Hz RTDE rate. AprilTag poses at
 the camera rate update the first six states. Frame capture and processing
 timestamps are kept separate; delayed measurements update a buffered EKF state
-and the stored 200 Hz predictions are replayed to the present. The resulting
+and the stored 1000 Hz predictions are replayed to the present. The resulting
 high-rate feature estimate is used as `s`. Estimated object twist `u_o` is used
 in the error derivative through `N*u_o`, and `N*u_o_dot` is compensated in the
 SOPD acceleration command. Motion compensation is smoothly enabled after the
